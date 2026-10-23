@@ -1,0 +1,294 @@
+{
+  "name": "agent-hub",
+  "displayName": "Agent Hub",
+  "description": "Pilote plusieurs agents de codage (Claude Code, Codex, OpenCode, Antigravity) avec délégation.",
+  "version": "0.1.0",
+  "publisher": "local",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "agentHub",
+          "title": "Agent Hub",
+          "icon": "media/agent-hub.svg"
+        }
+      ],
+      "secondarySidebar": [
+        {
+          "id": "agentHubChat",
+          "title": "Agent Hub",
+          "icon": "media/agent-hub.svg"
+        }
+      ]
+    },
+    "views": {
+      "agentHub": [
+        {
+          "id": "agentHub.threads",
+          "name": "Threads"
+        },
+        {
+          "id": "agentHub.changes",
+          "name": "Fichiers modifiés"
+        }
+      ],
+      "agentHubChat": [
+        {
+          "type": "webview",
+          "id": "agentHub.chat",
+          "name": "Chat"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "agentHub.newMainThread",
+        "title": "Agent Hub: Nouveau thread principal",
+        "icon": "$(add)"
+      },
+      {
+        "command": "agentHub.openThread",
+        "title": "Agent Hub: Ouvrir le thread"
+      },
+      {
+        "command": "agentHub.interruptThread",
+        "title": "Agent Hub: Interrompre le thread",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "agentHub.applyWorktree",
+        "title": "Agent Hub: Appliquer",
+        "icon": "$(check)"
+      },
+      {
+        "command": "agentHub.showThreadDiff",
+        "title": "Agent Hub: Voir le diff",
+        "icon": "$(diff)"
+      },
+      {
+        "command": "agentHub.removeWorktree",
+        "title": "Agent Hub: Supprimer le worktree",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "agentHub.toggleCommitPermission",
+        "title": "Agent Hub: Changer la permission de commit"
+      },
+      {
+        "command": "agentHub.showLog",
+        "title": "Agent Hub: Afficher le journal"
+      },
+      {
+        "command": "agentHub.delegateManual",
+        "title": "Agent Hub: Déléguer…",
+        "icon": "$(organization)"
+      },
+      {
+        "command": "agentHub.changeAgent",
+        "title": "Agent Hub: Changer d'agent",
+        "icon": "$(arrow-swap)"
+      },
+      {
+        "command": "agentHub.focusChat",
+        "title": "Agent Hub: Afficher le chat"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "agentHub.newMainThread",
+          "when": "view == agentHub.threads",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "agentHub.interruptThread",
+          "when": "view == agentHub.threads && viewItem =~ /running/",
+          "group": "inline"
+        },
+        {
+          "command": "agentHub.showThreadDiff",
+          "when": "view == agentHub.threads && viewItem =~ /worktree/",
+          "group": "worktree@1"
+        },
+        {
+          "command": "agentHub.applyWorktree",
+          "when": "view == agentHub.threads && viewItem =~ /worktree-done/",
+          "group": "worktree@2"
+        },
+        {
+          "command": "agentHub.removeWorktree",
+          "when": "view == agentHub.threads && viewItem =~ /worktree/ && viewItem =~ /finished/",
+          "group": "worktree@3"
+        },
+        {
+          "command": "agentHub.delegateManual",
+          "when": "view == agentHub.threads && viewItem =~ /thread (idle|finished) main/",
+          "group": "thread@1"
+        },
+        {
+          "command": "agentHub.changeAgent",
+          "when": "view == agentHub.threads && viewItem =~ /thread (idle|finished)/",
+          "group": "thread@2"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Agent Hub",
+      "properties": {
+        "agentHub.claude.path": {
+          "type": "string",
+          "default": "claude",
+          "description": "Chemin du CLI Claude Code."
+        },
+        "agentHub.codex.path": {
+          "type": "string",
+          "default": "codex",
+          "description": "Chemin du CLI Codex."
+        },
+        "agentHub.opencode.path": {
+          "type": "string",
+          "default": "opencode",
+          "description": "Chemin du CLI OpenCode."
+        },
+        "agentHub.agy.path": {
+          "type": "string",
+          "default": "agy",
+          "description": "Chemin du CLI Antigravity."
+        },
+        "agentHub.claude.defaultModel": {
+          "type": "string",
+          "default": ""
+        },
+        "agentHub.claude.defaultEffort": {
+          "type": "string",
+          "default": ""
+        },
+        "agentHub.codex.defaultModel": {
+          "type": "string",
+          "default": ""
+        },
+        "agentHub.codex.defaultEffort": {
+          "type": "string",
+          "default": ""
+        },
+        "agentHub.opencode.defaultModel": {
+          "type": "string",
+          "default": ""
+        },
+        "agentHub.opencode.defaultEffort": {
+          "type": "string",
+          "default": ""
+        },
+        "agentHub.agy.defaultModel": {
+          "type": "string",
+          "default": ""
+        },
+        "agentHub.agy.defaultEffort": {
+          "type": "string",
+          "default": ""
+        },
+        "agentHub.delegation.allowedModels": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Modèles que l'agent principal peut choisir pour déléguer (vide = tous)."
+        },
+        "agentHub.delegation.allowedAgents": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "claude",
+              "codex",
+              "opencode",
+              "agy"
+            ]
+          },
+          "default": [],
+          "description": "Agents que l'agent principal peut choisir pour déléguer (vide = tous)."
+        },
+        "agentHub.delegation.maxActiveThreads": {
+          "type": "number",
+          "default": 3
+        },
+        "agentHub.delegation.threadTimeoutSec": {
+          "type": "number",
+          "default": 1800
+        },
+        "agentHub.isolation.policy": {
+          "type": "string",
+          "enum": [
+            "agent-decides",
+            "always-worktree",
+            "always-shared"
+          ],
+          "default": "agent-decides"
+        },
+        "agentHub.worktree.includeUncommitted": {
+          "type": "boolean",
+          "default": true,
+          "description": "Reproduire les modifications non commitées du workspace dans chaque worktree."
+        },
+        "agentHub.worktree.linkPaths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "node_modules"
+          ],
+          "description": "Chemins ignorés par git à lier (ou copier) dans les worktrees."
+        },
+        "agentHub.git.mainAgentCommit": {
+          "type": "string",
+          "enum": [
+            "deny",
+            "ask",
+            "allow"
+          ],
+          "default": "deny",
+          "description": "Permission de commit de l'agent principal (outil MCP commit)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "build:integration": "esbuild test-integration/runTest.ts test-integration/suite.ts --bundle --platform=node --format=cjs --target=node20 --external:vscode --outdir=out-integration --log-level=warning",
+    "test:vscode": "npm run build && npm run build:integration && node out-integration/runTest.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/vscode": "^1.90.0",
+    "@vscode/test-electron": "^2.4.1",
+    "esbuild": "^0.23.0",
+    "typescript": "^5.5.0",
+    "vitest": "^2.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Fandresena040204/agent-hub.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Fandresena040204/agent-hub/issues"
+  },
+  "homepage": "https://github.com/Fandresena040204/agent-hub#readme"
+}

@@ -1,0 +1,4 @@
+{"type":"system","subtype":"init","session_id":"mock-session-1","model":"claude-haiku-5-5"}
+{ceci n'est pas du JSON
+{"type":"assistant","message":{"content":[{"type":"text","text":"bonjour"}]},"session_id":"mock-session-1"}
+{"type":"result","is_error":false,"result":"fini","total_cost_usd":0.01,"usage":{"input_tokens":10,"output_tokens":5}}

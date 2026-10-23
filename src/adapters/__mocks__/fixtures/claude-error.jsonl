@@ -1,0 +1,2 @@
+{"type":"system","subtype":"init","session_id":"mock-err","model":"claude-haiku-5-5"}
+{"type":"result","is_error":true,"result":"modèle surchargé","total_cost_usd":0,"usage":{"input_tokens":1,"output_tokens":0}}

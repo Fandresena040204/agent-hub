@@ -1,0 +1,23 @@
+Codex CLI (fixture de test, format documenté)
+
+Usage: codex [OPTIONS] [PROMPT]
+       codex [OPTIONS] <COMMAND> [ARGS]
+
+Commands:
+  exec      Run Codex non-interactively
+  models    List available models
+  login     Manage authentication
+
+Options:
+  -c, --config <key=value>
+          Override a configuration value. Exemple :
+            -c model_reasoning_effort="high"
+          model_reasoning_effort (valeurs : minimal, low, medium, high, xhigh)
+      --model <MODEL>
+          Modèle à utiliser. Valeurs possibles : {gpt-5.1-codex, gpt-5.1-codex-mini, gpt-5.1}
+      --sandbox <MODE>
+          Sandbox policy : read-only | workspace-write | danger-full-access
+      --json
+          Sortie JSONL sur stdout.
+      --skip-git-repo-check
+          Autoriser l'exécution hors dépôt git.

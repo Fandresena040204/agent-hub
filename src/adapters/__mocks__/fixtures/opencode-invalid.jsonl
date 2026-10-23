@@ -1,0 +1,5 @@
+{"type":"step_start","sessionID":"ses_mock_1","part":{}}
+pas du json
+{"type":"text","sessionID":"ses_mock_1","part":{"text":"bonjour"}}
+{"type":"step_finish","sessionID":"ses_mock_1","part":{"cost":0.002,"tokens":{"input":10,"output":4,"reasoning":1}}}
+{"type":"text","sessionID":"ses_mock_1","part":{"text":"fini"}}

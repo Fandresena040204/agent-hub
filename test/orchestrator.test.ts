@@ -1,0 +1,1065 @@
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
+import { Orchestrator, type OrchestratorConfig } from '../src/core/Orchestrator';
+import type { AgentAdapter, AgentCapabilities, AgentRun, StartOptions } from '../src/adapters/AgentAdapter';
+import type { AgentEvent } from '../src/core/events';
+import { AsyncQueue } from '../src/adapters/process';
+import { ThreadStore } from '../src/core/ThreadStore';
+import { git } from '../src/core/git';
+import type { AgentId } from '../src/core/types';
+
+// ── Faux adaptateur scriptable ─────────────────────────────────────────
+
+type Action =
+  | { kind: 'write'; path: string; content: string }
+  | { kind: 'commit'; message: string }
+  | { kind: 'emit'; event: AgentEvent };
+
+interface Turn {
+  steps: Action[];
+  summary?: string;
+}
+
+interface FakeOptions {
+  available?: boolean;
+  detail?: string;
+  caps?: AgentCapabilities;
+  turns?: Turn[];
+}
+
+const DEFAULT_CAPS: AgentCapabilities = {
+  models: [{ id: 'm1' }, { id: 'm2' }],
+  effortLevels: [{ id: 'low' }, { id: 'high' }],
+};
+
+class FakeAdapter implements AgentAdapter {
+  readonly received: string[] = [];
+  readonly starts: StartOptions[] = [];
+  gate?: Promise<void>;
+  private turns: Turn[];
+
+  constructor(
+    readonly id: AgentId,
+    readonly label: string,
+    private readonly opts: FakeOptions = {},
+  ) {
+    this.turns = [...(opts.turns ?? [])];
+  }
+
+  async isAvailable(): Promise<{ ok: boolean; detail?: string }> {
+    if (this.opts.available === false) return { ok: false, detail: this.opts.detail ?? 'indisponible' };
+    return { ok: true, detail: 'fake' };
+  }
+
+  async getCapabilities(): Promise<AgentCapabilities> {
+    return this.opts.caps ?? DEFAULT_CAPS;
+  }
+
+  start(options: StartOptions): AgentRun {
+    this.starts.push(options);
+    this.received.push(options.prompt);
+    const queue = new AsyncQueue<AgentEvent>();
+    let raw: ((stream: 'stdout' | 'stderr', line: string) => void) | undefined;
+    const sessionId = options.sessionId ?? `sess-${this.id}-${this.starts.length}`;
+
+    const runTurn = async (text: string): Promise<void> => {
+      // Laisse l'Orchestrateur s'abonner avant le premier événement.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      queue.push({ type: 'session_started', sessionId });
+      raw?.('stdout', `ligne brute ${text}`);
+      const turn = this.turns.shift() ?? { steps: [] };
+      for (const step of turn.steps) {
+        if (step.kind === 'emit') {
+          queue.push(step.event);
+        } else if (step.kind === 'write') {
+          const abs = path.resolve(options.cwd, step.path);
+          fs.mkdirSync(path.dirname(abs), { recursive: true });
+          fs.writeFileSync(abs, step.content, 'utf8');
+          queue.push({ type: 'file_changed', path: abs });
+        } else {
+          await git(options.cwd, ['add', '-A']);
+          await git(options.cwd, ['commit', '-m', step.message]);
+        }
+      }
+      if (this.gate) await this.gate;
+      queue.push({ type: 'done', summary: turn.summary ?? `fini ${text}` });
+    };
+
+    void runTurn(options.prompt);
+    return {
+      events: queue,
+      onRawLine: (cb) => {
+        raw = cb;
+      },
+      sendMessage: async (text: string) => {
+        this.received.push(text);
+        queue.push({ type: 'user_text', text });
+        void runTurn(text);
+      },
+      interrupt: async () => {
+        queue.close();
+      },
+    };
+  }
+}
+
+// ── Utilitaires ────────────────────────────────────────────────────────
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+async function createRepo(): Promise<string> {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-test-'));
+  await git(dir, ['init']);
+  await git(dir, ['config', 'user.email', 'test@test.com']);
+  await git(dir, ['config', 'user.name', 'Test User']);
+  fs.writeFileSync(path.join(dir, 'README.md'), '# Test\n');
+  await git(dir, ['add', 'README.md']);
+  await git(dir, ['commit', '-m', 'Initial commit']);
+  return dir;
+}
+
+const ACTIVE = ['starting', 'running'];
+
+describe('Orchestrator', () => {
+  let repoDir: string;
+  let storageDir: string;
+  let store: ThreadStore;
+  let cfg: OrchestratorConfig;
+  let orch: Orchestrator | undefined;
+
+  beforeEach(async () => {
+    repoDir = await createRepo();
+    storageDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-storage-'));
+    store = new ThreadStore(storageDir);
+    cfg = {
+      maxActiveThreads: 3,
+      threadTimeoutSec: 30,
+      isolationPolicy: 'agent-decides',
+      includeUncommitted: false,
+      linkPaths: [],
+      mainAgentCommit: 'deny',
+      defaults: {},
+    };
+  });
+
+  afterEach(async () => {
+    await orch?.dispose();
+    orch = undefined;
+    for (const dir of [repoDir, storageDir]) {
+      if (!dir || !fs.existsSync(dir)) continue;
+      try {
+        fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      } catch {
+        // Nettoyage best-effort : dossiers temporaires, jamais bloquant.
+      }
+    }
+  });
+
+  function build(adapters: Partial<Record<AgentId, AgentAdapter>>): Orchestrator {
+    orch = new Orchestrator({
+      workspaceRoot: repoDir,
+      storageDir,
+      adapters,
+      store,
+      config: () => cfg,
+    });
+    return orch;
+  }
+
+  function mainAdapter(turns: Turn[] = [{ steps: [] }]): FakeAdapter {
+    return new FakeAdapter('claude', 'Claude', { turns });
+  }
+
+  it('thread principal : événements stockés, statut idle, sendMessage relance', async () => {
+    const claude = mainAdapter([
+      {
+        steps: [{ kind: 'emit', event: { type: 'assistant_text', text: 'Bonjour', partial: false } }],
+        summary: 'fini',
+      },
+    ]);
+    const o = build({ claude });
+    await o.init();
+
+    const thread = await o.startMainThread({ agent: 'claude', prompt: 'Fais un truc', permissionMode: 'edit' });
+    const done = await o.waitThread(thread.id, 10);
+    expect(done.status).toBe('idle');
+
+    const events = o.getEvents(thread.id);
+    expect(events[0].event).toMatchObject({ type: 'user_text', text: 'Fais un truc' });
+    const types = events.map((e) => e.event.type);
+    expect(types).toContain('assistant_text');
+    expect(types).toContain('done');
+
+    await o.sendMessage(thread.id, 'encore');
+    const again = await o.waitThread(thread.id, 10);
+    expect(again.status).toBe('idle');
+    expect(claude.received).toEqual(['Fais un truc', 'encore']);
+    expect(o.getEvents(thread.id).filter((e) => e.event.type === 'user_text')).toHaveLength(2);
+  });
+
+  it('delegate : effort invalide listé, agent indisponible', async () => {
+    const claude = mainAdapter();
+    const codex = new FakeAdapter('codex', 'Codex', { available: false, detail: 'CLI absent' });
+    const o = build({ claude, codex });
+    await o.init();
+
+    const main = await o.startMainThread({ agent: 'claude', prompt: 'main', permissionMode: 'edit' });
+    await o.waitThread(main.id, 10);
+
+    await expect(
+      o.delegate(main.id, { agent: 'claude', prompt: 'x', mode: 'readonly', effort: 'turbo' }),
+    ).rejects.toThrow(/low, high/);
+    await expect(
+      o.delegate(main.id, { agent: 'codex', prompt: 'x', mode: 'readonly' }),
+    ).rejects.toThrow(/indisponible.*CLI absent/);
+  });
+
+  it('delegate : profondeur maximale et limite de threads actifs', async () => {
+    const claude = mainAdapter();
+    const codex = new FakeAdapter('codex', 'Codex', { turns: [{ steps: [] }] });
+    const o = build({ claude, codex });
+    await o.init();
+
+    const main = await o.startMainThread({ agent: 'claude', prompt: 'main', permissionMode: 'edit' });
+    await o.waitThread(main.id, 10);
+
+    const sub = await o.delegate(main.id, { agent: 'codex', prompt: 'sub', mode: 'readonly' });
+    await o.waitThread(sub.id, 10);
+    await expect(
+      o.delegate(sub.id, { agent: 'codex', prompt: 'x', mode: 'readonly' }),
+    ).rejects.toThrow(/Profondeur de délégation maximale/);
+
+    cfg.maxActiveThreads = 1;
+    const gate = deferred();
+    claude.gate = gate.promise;
+    const running = await o.delegate(main.id, { agent: 'claude', prompt: 'long', mode: 'readonly' });
+    expect(ACTIVE).toContain(running.status);
+    await expect(
+      o.delegate(main.id, { agent: 'codex', prompt: 'y', mode: 'readonly' }),
+    ).rejects.toThrow(/Limite de threads délégués actifs atteinte \(1\)/);
+    gate.resolve();
+    await o.waitThread(running.id, 10);
+  });
+
+  it('delegate : scopes qui se chevauchent refusés en nommant le premier thread', async () => {
+    const claude = mainAdapter();
+    const codex = new FakeAdapter('codex', 'Codex', { turns: [{ steps: [] }] });
+    const o = build({ claude, codex });
+    await o.init();
+
+    const main = await o.startMainThread({ agent: 'claude', prompt: 'main', permissionMode: 'edit' });
+    await o.waitThread(main.id, 10);
+
+    const gate = deferred();
+    claude.gate = gate.promise;
+    const first = await o.delegate(main.id, {
+      agent: 'claude',
+      prompt: 'a',
+      mode: 'edit',
+      isolation: 'shared',
+      scope: ['src/**'],
+    });
+    await expect(
+      o.delegate(main.id, {
+        agent: 'codex',
+        prompt: 'b',
+        mode: 'edit',
+        isolation: 'shared',
+        scope: ['src/a.ts'],
+      }),
+    ).rejects.toThrow(new RegExp(first.id));
+    gate.resolve();
+    await o.waitThread(first.id, 10);
+  });
+
+  it('shared : écriture hors scope → scope_violation', async () => {
+    const claude = mainAdapter();
+    const codex = new FakeAdapter('codex', 'Codex', {
+      turns: [{ steps: [{ kind: 'write', path: 'docs/out.txt', content: 'x' }] }],
+    });
+    const o = build({ claude, codex });
+    await o.init();
+
+    const main = await o.startMainThread({ agent: 'claude', prompt: 'main', permissionMode: 'edit' });
+    await o.waitThread(main.id, 10);
+    const sub = await o.delegate(main.id, {
+      agent: 'codex',
+      prompt: 'sub',
+      mode: 'edit',
+      isolation: 'shared',
+      scope: ['src/**'],
+    });
+    const done = await o.waitThread(sub.id, 10);
+    expect(done.status).toBe('done');
+    expect(done.violations.scope).toContain('docs/out.txt');
+    expect(
+      o.getEvents(sub.id).some(
+        (e) => e.event.type === 'scope_violation' && e.event.path === 'docs/out.txt',
+      ),
+    ).toBe(true);
+  });
+
+  it('sous-agent qui lance git commit → commit_violation', async () => {
+    const claude = mainAdapter();
+    const codex = new FakeAdapter('codex', 'Codex', {
+      turns: [
+        {
+          steps: [
+            { kind: 'write', path: 'src/a.ts', content: 'a' },
+            { kind: 'commit', message: 'triche' },
+          ],
+        },
+      ],
+    });
+    const o = build({ claude, codex });
+    await o.init();
+
+    const main = await o.startMainThread({ agent: 'claude', prompt: 'main', permissionMode: 'edit' });
+    await o.waitThread(main.id, 10);
+    const sub = await o.delegate(main.id, {
+      agent: 'codex',
+      prompt: 'sub',
+      mode: 'edit',
+      isolation: 'shared',
+      scope: ['src/**'],
+    });
+    const done = await o.waitThread(sub.id, 10);
+    expect(done.violations.commits).toHaveLength(1);
+    expect(o.getEvents(sub.id).some((e) => e.event.type === 'commit_violation')).toBe(true);
+  });
+
+  it('worktree : workspace intact avant merge, fichier appliqué non commité après', async () => {
+    const claude = mainAdapter();
+    const codex = new FakeAdapter('codex', 'Codex', {
+      turns: [{ steps: [{ kind: 'write', path: 'src/wt.ts', content: 'wt' }] }],
+    });
+    const o = build({ claude, codex });
+    await o.init();
+
+    const main = await o.startMainThread({ agent: 'claude', prompt: 'main', permissionMode: 'edit' });
+    await o.waitThread(main.id, 10);
+
+    const headBefore = (await git(repoDir, ['rev-parse', 'HEAD'])).stdout.trim();
+    const branchesBefore = (await git(repoDir, ['branch', '--list'])).stdout;
+
+    const sub = await o.delegate(main.id, {
+      agent: 'codex',
+      prompt: 'worktree',
+      mode: 'edit',
+      isolation: 'worktree',
+    });
+    const done = await o.waitThread(sub.id, 10);
+    expect(done.status).toBe('done');
+
+    expect(fs.existsSync(path.join(repoDir, 'src', 'wt.ts'))).toBe(false);
+    expect((await git(repoDir, ['rev-parse', 'HEAD'])).stdout.trim()).toBe(headBefore);
+    expect((await git(repoDir, ['branch', '--list'])).stdout).toBe(branchesBefore);
+
+    const files = await o.changedFiles(sub.id);
+    expect(files.map((f) => f.path)).toContain('src/wt.ts');
+    expect(files.find((f) => f.path === 'src/wt.ts')!.status).toBe('added');
+
+    const result = await o.mergeThread(sub.id);
+    expect(result.status).toBe('applied');
+    expect(fs.existsSync(path.join(repoDir, 'src', 'wt.ts'))).toBe(true);
+    expect((await git(repoDir, ['status', '--porcelain', '-uall'])).stdout).toContain('src/wt.ts');
+    expect((await git(repoDir, ['rev-parse', 'HEAD'])).stdout.trim()).toBe(headBefore);
+    expect(o.getThread(sub.id)!.status).toBe('applied');
+  });
+
+  it('commit : deny refuse clairement', async () => {
+    cfg.mainAgentCommit = 'deny';
+    const claude = mainAdapter();
+    const o = build({ claude });
+    await o.init();
+    const main = await o.startMainThread({ agent: 'claude', prompt: 'main', permissionMode: 'edit' });
+    await o.waitThread(main.id, 10);
+
+    await expect(
+      o.commit({ callerThreadId: main.id, message: 'm', paths: ['README.md'] }, async () => true),
+    ).rejects.toThrow(/permission de commit/);
+  });
+
+  it('commit : ask + refus utilisateur ne change pas HEAD', async () => {
+    cfg.mainAgentCommit = 'ask';
+    const claude = mainAdapter();
+    const o = build({ claude });
+    await o.init();
+    const main = await o.startMainThread({ agent: 'claude', prompt: 'main', permissionMode: 'edit' });
+    await o.waitThread(main.id, 10);
+
+    fs.mkdirSync(path.join(repoDir, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(repoDir, 'src', 'a.ts'), 'a');
+    const headBefore = (await git(repoDir, ['rev-parse', 'HEAD'])).stdout.trim();
+
+    let previewed = false;
+    await expect(
+      o.commit({ callerThreadId: main.id, message: 'm', paths: ['src/a.ts'] }, async (preview) => {
+        previewed = true;
+        expect(preview.paths).toContain('src/a.ts');
+        return false;
+      }),
+    ).rejects.toThrow(/refusé par l'utilisateur/);
+    expect(previewed).toBe(true);
+    expect((await git(repoDir, ['rev-parse', 'HEAD'])).stdout.trim()).toBe(headBefore);
+  });
+
+  it('commit : allow crée le commit, émet commit_made, aucun commit_violation', async () => {
+    cfg.mainAgentCommit = 'allow';
+    const gate = deferred();
+    const claude = mainAdapter();
+    claude.gate = gate.promise;
+    const codex = new FakeAdapter('codex', 'Codex', {
+      turns: [{ steps: [{ kind: 'write', path: 'src/a.ts', content: 'a' }] }],
+    });
+    const o = build({ claude, codex });
+    await o.init();
+
+    const main = await o.startMainThread({ agent: 'claude', prompt: 'main', permissionMode: 'edit' });
+    const sub = await o.delegate(main.id, {
+      agent: 'codex',
+      prompt: 'sub',
+      mode: 'edit',
+      isolation: 'shared',
+      scope: ['src/**'],
+    });
+    await o.waitThread(sub.id, 10);
+
+    const headBefore = (await git(repoDir, ['rev-parse', 'HEAD'])).stdout.trim();
+    const result = await o.commit(
+      { callerThreadId: main.id, message: 'feat: ajout', threadIds: [sub.id] },
+      async () => true,
+    );
+    expect(result.paths).toEqual(['src/a.ts']);
+    expect(result.sha).toMatch(/^[0-9a-f]{7,40}$/);
+
+    const headAfter = (await git(repoDir, ['rev-parse', 'HEAD'])).stdout.trim();
+    expect(headAfter).not.toBe(headBefore);
+    expect((await git(repoDir, ['log', '-1', '--format=%s'])).stdout.trim()).toBe('feat: ajout');
+
+    expect(o.getEvents(main.id).some((e) => e.event.type === 'commit_made')).toBe(true);
+
+    // Le thread principal reprend après le commit : son watcher doit avoir été aligné.
+    gate.resolve();
+    await o.waitThread(main.id, 10);
+    expect(o.getThread(main.id)!.violations.commits).toHaveLength(0);
+    expect(o.getEvents(main.id).some((e) => e.event.type === 'commit_violation')).toBe(false);
+  });
+
+  it('commit : refuse un thread encore actif', async () => {
+    cfg.mainAgentCommit = 'allow';
+    const claude = mainAdapter();
+    const gate = deferred();
+    const codex = new FakeAdapter('codex', 'Codex', { turns: [{ steps: [] }] });
+    codex.gate = gate.promise;
+    const o = build({ claude, codex });
+    await o.init();
+
+    const main = await o.startMainThread({ agent: 'claude', prompt: 'main', permissionMode: 'edit' });
+    await o.waitThread(main.id, 10);
+    const sub = await o.delegate(main.id, {
+      agent: 'codex',
+      prompt: 'sub',
+      mode: 'edit',
+      isolation: 'shared',
+      scope: ['src/**'],
+    });
+
+    await expect(
+      o.commit({ callerThreadId: main.id, message: 'm', threadIds: [sub.id] }, async () => true),
+    ).rejects.toThrow(/encore actif/);
+    gate.resolve();
+    await o.waitThread(sub.id, 10);
+  });
+
+  it('commit : refuse un worktree non appliqué', async () => {
+    cfg.mainAgentCommit = 'allow';
+    const claude = mainAdapter();
+    const codex = new FakeAdapter('codex', 'Codex', {
+      turns: [{ steps: [{ kind: 'write', path: 'src/wt.ts', content: 'wt' }] }],
+    });
+    const o = build({ claude, codex });
+    await o.init();
+
+    const main = await o.startMainThread({ agent: 'claude', prompt: 'main', permissionMode: 'edit' });
+    await o.waitThread(main.id, 10);
+    const sub = await o.delegate(main.id, {
+      agent: 'codex',
+      prompt: 'wt',
+      mode: 'edit',
+      isolation: 'worktree',
+    });
+    await o.waitThread(sub.id, 10);
+
+    await expect(
+      o.commit({ callerThreadId: main.id, message: 'm', threadIds: [sub.id] }, async () => true),
+    ).rejects.toThrow(/merge_thread/);
+  });
+
+  it('changedFiles shared : base correcte malgré une modification préalable', async () => {
+    fs.mkdirSync(path.join(repoDir, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(repoDir, 'src', 'a.ts'), 'base');
+    await git(repoDir, ['add', '.']);
+    await git(repoDir, ['commit', '-m', 'src initial']);
+
+    // Modifications non commitées AVANT le démarrage du thread.
+    fs.writeFileSync(path.join(repoDir, 'src', 'a.ts'), 'pre');
+    fs.writeFileSync(path.join(repoDir, 'src', 'other.ts'), 'pre2');
+
+    const claude = mainAdapter();
+    const codex = new FakeAdapter('codex', 'Codex', {
+      turns: [{ steps: [{ kind: 'write', path: 'src/a.ts', content: 'thread' }] }],
+    });
+    const o = build({ claude, codex });
+    await o.init();
+
+    const main = await o.startMainThread({ agent: 'claude', prompt: 'main', permissionMode: 'edit' });
+    await o.waitThread(main.id, 10);
+    const sub = await o.delegate(main.id, {
+      agent: 'codex',
+      prompt: 'sub',
+      mode: 'edit',
+      isolation: 'shared',
+      scope: ['src/**'],
+    });
+    await o.waitThread(sub.id, 10);
+
+    const files = await o.changedFiles(sub.id);
+    expect(files.map((f) => f.path)).toEqual(['src/a.ts']);
+    expect(files[0].status).toBe('modified');
+    expect(await o.baseContent(sub.id, 'src/a.ts')).toBe('pre');
+  });
+
+  // ── Changement d'agent ─────────────────────────────────────────────────
+
+  it('changeAgent même CLI : agent_switched resume, session conservée, nouveau modèle/effort', async () => {
+    const claude = mainAdapter();
+    const o = build({ claude });
+    await o.init();
+
+    const main = await o.startMainThread({
+      agent: 'claude', model: 'm1', effort: 'low', prompt: 'main', permissionMode: 'edit',
+    });
+    await o.waitThread(main.id, 10);
+    expect(o.getThread(main.id)!.sessionId).toBe('sess-claude-1');
+
+    const switched = await o.changeAgent(main.id, { agent: 'claude', model: 'm2', effort: 'high' });
+    expect(switched.agent).toBe('claude');
+    expect(switched.model).toBe('m2');
+    expect(switched.effort).toBe('high');
+    expect(switched.sessionId).toBe('sess-claude-1');
+    expect(switched.agentHistory).toMatchObject([
+      { agent: 'claude', model: 'm1', effort: 'low', sessionId: 'sess-claude-1', mode: 'start' },
+      { agent: 'claude', model: 'm2', effort: 'high', mode: 'resume' },
+    ]);
+    expect(
+      o.getEvents(main.id).some(
+        (e) => e.event.type === 'agent_switched' && e.event.mode === 'resume' &&
+          e.event.from.agent === 'claude' && e.event.to.model === 'm2',
+      ),
+    ).toBe(true);
+    expect(claude.starts).toHaveLength(1);
+
+    await o.sendMessage(main.id, 'suite');
+    await o.waitThread(main.id, 10);
+    expect(claude.starts[1].sessionId).toBe('sess-claude-1');
+    expect(claude.starts[1].model).toBe('m2');
+    expect(claude.starts[1].effort).toBe('high');
+  });
+
+  it('changeAgent autre CLI : mode handoff, session vidée, dossier préfixé au message', async () => {
+    const claude = mainAdapter([
+      { steps: [{ kind: 'emit', event: { type: 'assistant_text', text: 'État initial', partial: false } }] },
+    ]);
+    const codex = new FakeAdapter('codex', 'Codex', { turns: [{ steps: [] }] });
+    const o = build({ claude, codex });
+    await o.init();
+
+    const main = await o.startMainThread({
+      agent: 'claude', model: 'm1', effort: 'low', prompt: 'Objectif initial', permissionMode: 'edit',
+    });
+    await o.waitThread(main.id, 10);
+
+    const switched = await o.changeAgent(main.id, {
+      agent: 'codex',
+      model: 'm1',
+      effort: 'high',
+      message: 'Continue le projet',
+    });
+    expect(switched.agent).toBe('codex');
+    expect(switched.sessionId).toBeUndefined();
+    expect(switched.agentHistory).toMatchObject([
+      { agent: 'claude', mode: 'start' },
+      { agent: 'codex', model: 'm1', effort: 'high', mode: 'handoff' },
+    ]);
+    expect(
+      o.getEvents(main.id).some((e) => e.event.type === 'agent_switched' && e.event.mode === 'handoff'),
+    ).toBe(true);
+
+    await o.waitThread(main.id, 10);
+    const prompt = codex.starts[0].prompt;
+    expect(prompt.startsWith('Dossier de passation')).toBe(true);
+    expect(prompt).toContain('Continue le projet');
+    expect(prompt).toContain('Objectif initial');
+    expect(prompt).toContain('thread à la place de claude/m1');
+    expect(o.getThread(main.id)!.sessionId).toBe('sess-codex-1');
+    expect(o.getThread(main.id)!.agentHistory?.at(-1)?.sessionId).toBe('sess-codex-1');
+  });
+
+  it('changeAgent avec handoffSummary : tour supplémentaire sur l\'ancien agent, résumé dans le dossier', async () => {
+    const claude = mainAdapter([
+      { steps: [] },
+      {
+        steps: [
+          { kind: 'emit', event: { type: 'assistant_text', text: 'RÉSUMÉ DE PASSATION COMPLET', partial: false } },
+        ],
+      },
+    ]);
+    const codex = new FakeAdapter('codex', 'Codex', { turns: [{ steps: [] }] });
+    const o = build({ claude, codex });
+    await o.init();
+
+    const main = await o.startMainThread({
+      agent: 'claude', model: 'm1', effort: 'low', prompt: 'main', permissionMode: 'edit',
+    });
+    await o.waitThread(main.id, 10);
+
+    await o.changeAgent(main.id, {
+      agent: 'codex',
+      model: 'm1',
+      effort: 'low',
+      handoffSummary: true,
+    });
+
+    expect(claude.starts).toHaveLength(2);
+    expect(claude.received[1]).toContain('Passation');
+    expect(claude.received[1]).toContain('résumé de passation');
+
+    await o.sendMessage(main.id, 'reprends');
+    await o.waitThread(main.id, 10);
+    const prompt = codex.starts[0].prompt;
+    expect(prompt).toContain('RÉSUMÉ DE PASSATION COMPLET');
+    expect(prompt).toContain('## Résumé de l\'agent sortant');
+  });
+
+  it('changeAgent refuse un thread en cours', async () => {
+    const claude = mainAdapter();
+    const gate = deferred();
+    claude.gate = gate.promise;
+    const o = build({ claude });
+    await o.init();
+
+    const main = await o.startMainThread({ agent: 'claude', prompt: 'long', permissionMode: 'edit' });
+    await expect(
+      o.changeAgent(main.id, { agent: 'claude', model: 'm2', effort: 'high' }),
+    ).rejects.toThrow(/est en cours.*attendez la fin du tour/);
+
+    gate.resolve();
+    await o.waitThread(main.id, 10);
+  });
+
+  it('changeAgent refuse un effort invalide pour le modèle, en listant ses valeurs', async () => {
+    const caps: AgentCapabilities = {
+      models: [{ id: 'm1' }, { id: 'm2' }],
+      effortLevels: [{ id: 'low' }, { id: 'high' }],
+      effortLevelsByModel: { m1: [{ id: 'low' }], m2: [{ id: 'high' }] },
+    };
+    const claude = new FakeAdapter('claude', 'Claude', { caps });
+    const o = build({ claude });
+    await o.init();
+
+    const main = await o.startMainThread({
+      agent: 'claude', model: 'm1', effort: 'low', prompt: 'main', permissionMode: 'edit',
+    });
+    await o.waitThread(main.id, 10);
+
+    await expect(
+      o.changeAgent(main.id, { agent: 'claude', model: 'm2', effort: 'low' }),
+    ).rejects.toThrow(/Niveau d'effort invalide.*Valeurs valides : high/);
+    expect(o.getThread(main.id)!.model).toBe('m1');
+    expect(o.getThread(main.id)!.agentHistory).toBeUndefined();
+  });
+
+  it('changeAgent thread principal : le nouvel adaptateur reçoit le même jeton MCP', async () => {
+    const claude = mainAdapter();
+    const codex = new FakeAdapter('codex', 'Codex', { turns: [{ steps: [] }] });
+    const o = build({ claude, codex });
+    await o.init();
+
+    const url = 'http://127.0.0.1:4321/mcp';
+    const tokens = new Map<string, string>();
+    let n = 0;
+    o.setMcp({
+      url: () => url,
+      registerMainThread: (id: string) => {
+        let tok = tokens.get(id);
+        if (!tok) {
+          tok = `jeton-${++n}`;
+          tokens.set(id, tok);
+        }
+        return tok;
+      },
+      unregister: (id: string) => {
+        tokens.delete(id);
+      },
+    });
+
+    const main = await o.startMainThread({
+      agent: 'claude', model: 'm1', effort: 'low', prompt: 'main', permissionMode: 'edit',
+    });
+    await o.waitThread(main.id, 10);
+    expect(claude.starts[0].mcpToken).toBe('jeton-1');
+
+    await o.changeAgent(main.id, { agent: 'codex', model: 'm1', effort: 'low' });
+    await o.sendMessage(main.id, 'suite');
+    await o.waitThread(main.id, 10);
+
+    expect(codex.starts[0].mcpServerUrl).toBe(url);
+    expect(codex.starts[0].mcpToken).toBe('jeton-1');
+  });
+
+  it('changeAgent du parent n\'interrompt pas un thread délégué en cours', async () => {
+    const claude = mainAdapter();
+    const codex = new FakeAdapter('codex', 'Codex', { turns: [{ steps: [] }] });
+    const o = build({ claude, codex });
+    await o.init();
+
+    const main = await o.startMainThread({
+      agent: 'claude', model: 'm1', effort: 'low', prompt: 'main', permissionMode: 'edit',
+    });
+    await o.waitThread(main.id, 10);
+
+    const gate = deferred();
+    codex.gate = gate.promise;
+    const sub = await o.delegate(main.id, { agent: 'codex', prompt: 'sub', mode: 'readonly' });
+    expect(ACTIVE).toContain(o.getThread(sub.id)!.status);
+
+    await o.changeAgent(main.id, { agent: 'codex', model: 'm1', effort: 'low' });
+    expect(o.getThread(main.id)!.agent).toBe('codex');
+    expect(ACTIVE).toContain(o.getThread(sub.id)!.status);
+    expect(codex.starts).toHaveLength(1);
+
+    gate.resolve();
+    const done = await o.waitThread(sub.id, 10);
+    expect(done.status).toBe('done');
+  });
+
+  it('changeAgent sur un thread délégué : garde scope, isolation et gitPolicy sub, sans MCP', async () => {
+    const claude = mainAdapter();
+    const codex = new FakeAdapter('codex', 'Codex', { turns: [{ steps: [] }] });
+    const o = build({ claude, codex });
+    await o.init();
+
+    const main = await o.startMainThread({
+      agent: 'claude', model: 'm1', effort: 'low', prompt: 'main', permissionMode: 'edit',
+    });
+    await o.waitThread(main.id, 10);
+    const sub = await o.delegate(main.id, {
+      agent: 'codex',
+      prompt: 'sub',
+      mode: 'edit',
+      isolation: 'shared',
+      scope: ['src/**'],
+    });
+    await o.waitThread(sub.id, 10);
+
+    await o.changeAgent(sub.id, { agent: 'claude', model: 'm2', effort: 'high', message: 'reprends' });
+    await o.waitThread(sub.id, 10);
+
+    const opts = claude.starts[1];
+    expect(opts.cwd).toBe(repoDir);
+    expect(opts.permissionMode).toBe('edit');
+    expect(opts.allowedPaths).toEqual(['src/**']);
+    expect(opts.gitPolicy).toEqual({ forbidden: expect.any(Array), role: 'sub' });
+    expect(opts.mcpServerUrl).toBeUndefined();
+    expect(opts.mcpToken).toBeUndefined();
+    expect(opts.prompt.startsWith('Dossier de passation')).toBe(true);
+
+    const switched = o.getThread(sub.id)!;
+    expect(switched.isolation).toBe('shared');
+    expect(switched.scope).toEqual(['src/**']);
+    expect(switched.agentHistory).toMatchObject([
+      { agent: 'codex', mode: 'start' },
+      { agent: 'claude', model: 'm2', effort: 'high', mode: 'handoff' },
+    ]);
+  });
+
+  it('changeAgent sans changement réel → erreur', async () => {
+    const claude = mainAdapter();
+    const o = build({ claude });
+    await o.init();
+    const main = await o.startMainThread({
+      agent: 'claude', model: 'm1', effort: 'low', prompt: 'main', permissionMode: 'edit',
+    });
+    await o.waitThread(main.id, 10);
+
+    await expect(
+      o.changeAgent(main.id, { agent: 'claude', model: 'm1', effort: 'low' }),
+    ).rejects.toThrow(/Aucun changement/);
+  });
+
+  // ── Statistiques +/− et annulation par fichier ─────────────────────────
+
+  it('stats shared : +N/−N par rapport à la base du thread', async () => {
+    fs.mkdirSync(path.join(repoDir, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(repoDir, 'src', 'a.ts'), 'ligne1\nligne2\nligne3\n');
+    await git(repoDir, ['add', '.']);
+    await git(repoDir, ['commit', '-m', 'src initial']);
+
+    const claude = mainAdapter();
+    const codex = new FakeAdapter('codex', 'Codex', {
+      turns: [
+        {
+          steps: [
+            { kind: 'write', path: 'src/a.ts', content: 'ligne1\nMODIFIÉE\nligne3\n' },
+            { kind: 'write', path: 'src/new.ts', content: 'x\ny\n' },
+          ],
+        },
+      ],
+    });
+    const o = build({ claude, codex });
+    await o.init();
+
+    const main = await o.startMainThread({ agent: 'claude', prompt: 'main', permissionMode: 'edit' });
+    await o.waitThread(main.id, 10);
+    const sub = await o.delegate(main.id, {
+      agent: 'codex',
+      prompt: 'sub',
+      mode: 'edit',
+      isolation: 'shared',
+      scope: ['src/**'],
+    });
+    await o.waitThread(sub.id, 10);
+
+    const files = await o.changedFiles(sub.id);
+    const modified = files.find((f) => f.path === 'src/a.ts');
+    expect(modified?.status).toBe('modified');
+    expect(modified?.additions).toBe(1);
+    expect(modified?.deletions).toBe(1);
+
+    const created = files.find((f) => f.path === 'src/new.ts');
+    expect(created?.status).toBe('added');
+    expect(created?.additions).toBe(2);
+    expect(created?.deletions).toBe(0);
+  });
+
+  it('stats worktree : +N/−N entre baseTree et worktree', async () => {
+    const claude = mainAdapter();
+    const codex = new FakeAdapter('codex', 'Codex', {
+      turns: [
+        {
+          steps: [
+            { kind: 'write', path: 'README.md', content: '# Agent\n' },
+            { kind: 'write', path: 'src/wt.ts', content: 'a\nb\n' },
+          ],
+        },
+      ],
+    });
+    const o = build({ claude, codex });
+    await o.init();
+
+    const main = await o.startMainThread({ agent: 'claude', prompt: 'main', permissionMode: 'edit' });
+    await o.waitThread(main.id, 10);
+    const sub = await o.delegate(main.id, {
+      agent: 'codex',
+      prompt: 'wt',
+      mode: 'edit',
+      isolation: 'worktree',
+    });
+    await o.waitThread(sub.id, 10);
+
+    const files = await o.changedFiles(sub.id);
+    const modified = files.find((f) => f.path === 'README.md');
+    expect(modified?.status).toBe('modified');
+    expect(modified?.additions).toBe(1);
+    expect(modified?.deletions).toBe(1);
+
+    const created = files.find((f) => f.path === 'src/wt.ts');
+    expect(created?.status).toBe('added');
+    expect(created?.additions).toBe(2);
+    expect(created?.deletions).toBe(0);
+  });
+
+  it('revertFiles shared : base restaurée, fichier créé supprimé, HEAD/index intacts', async () => {
+    fs.mkdirSync(path.join(repoDir, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(repoDir, 'src', 'a.ts'), 'base\n');
+    await git(repoDir, ['add', '.']);
+    await git(repoDir, ['commit', '-m', 'src initial']);
+    const headBefore = (await git(repoDir, ['rev-parse', 'HEAD'])).stdout.trim();
+
+    const claude = mainAdapter();
+    const codex = new FakeAdapter('codex', 'Codex', {
+      turns: [
+        {
+          steps: [
+            { kind: 'write', path: 'src/a.ts', content: 'modifié\n' },
+            { kind: 'write', path: 'src/new.ts', content: 'nouveau\n' },
+          ],
+        },
+      ],
+    });
+    const o = build({ claude, codex });
+    await o.init();
+
+    const main = await o.startMainThread({ agent: 'claude', prompt: 'main', permissionMode: 'edit' });
+    await o.waitThread(main.id, 10);
+    const sub = await o.delegate(main.id, {
+      agent: 'codex',
+      prompt: 'sub',
+      mode: 'edit',
+      isolation: 'shared',
+      scope: ['src/**'],
+    });
+    await o.waitThread(sub.id, 10);
+    expect(fs.readFileSync(path.join(repoDir, 'src', 'a.ts'), 'utf8')).toBe('modifié\n');
+
+    const before = o.getEvents(sub.id).length;
+    await o.revertFiles(sub.id, ['src/a.ts', 'src/new.ts']);
+
+    expect(fs.readFileSync(path.join(repoDir, 'src', 'a.ts'), 'utf8').replace(/\r\n/g, '\n')).toBe('base\n');
+    expect(fs.existsSync(path.join(repoDir, 'src', 'new.ts'))).toBe(false);
+    expect((await git(repoDir, ['rev-parse', 'HEAD'])).stdout.trim()).toBe(headBefore);
+    expect((await git(repoDir, ['diff', '--cached', '--name-only'])).stdout.trim()).toBe('');
+
+    const status = (await git(repoDir, ['status', '--porcelain', '-uall'])).stdout;
+    expect(status).not.toContain('src/a.ts');
+    expect(status).not.toContain('src/new.ts');
+
+    const added = o.getEvents(sub.id).slice(before);
+    expect(
+      added.some(
+        (e) =>
+          e.event.type === 'assistant_text' &&
+          !e.event.partial &&
+          e.event.text === '[Agent Hub] Modifications annulées : src/a.ts, src/new.ts',
+      ),
+    ).toBe(true);
+
+    expect(await o.changedFiles(sub.id)).toEqual([]);
+  });
+
+  it('revertFiles worktree non appliqué : workspace intact, worktree restauré', async () => {
+    const claude = mainAdapter();
+    const codex = new FakeAdapter('codex', 'Codex', {
+      turns: [
+        {
+          steps: [
+            { kind: 'write', path: 'README.md', content: '# Agent\n' },
+            { kind: 'write', path: 'src/wt.ts', content: 'wt\n' },
+          ],
+        },
+      ],
+    });
+    const o = build({ claude, codex });
+    await o.init();
+
+    const main = await o.startMainThread({ agent: 'claude', prompt: 'main', permissionMode: 'edit' });
+    await o.waitThread(main.id, 10);
+    const sub = await o.delegate(main.id, {
+      agent: 'codex',
+      prompt: 'wt',
+      mode: 'edit',
+      isolation: 'worktree',
+    });
+    await o.waitThread(sub.id, 10);
+
+    const wtPath = o.getThread(sub.id)!.worktreePath!;
+    expect(fs.existsSync(path.join(repoDir, 'src', 'wt.ts'))).toBe(false);
+
+    await o.revertFiles(sub.id, ['README.md', 'src/wt.ts']);
+
+    // Worktree revenu à la base.
+    expect(fs.readFileSync(path.join(wtPath, 'README.md'), 'utf8').replace(/\r\n/g, '\n')).toBe('# Test\n');
+    expect(fs.existsSync(path.join(wtPath, 'src', 'wt.ts'))).toBe(false);
+    // Workspace jamais touché.
+    expect(fs.existsSync(path.join(repoDir, 'src', 'wt.ts'))).toBe(false);
+    expect(fs.readFileSync(path.join(repoDir, 'README.md'), 'utf8').replace(/\r\n/g, '\n')).toBe('# Test\n');
+
+    expect(await o.changedFiles(sub.id)).toEqual([]);
+  });
+
+  it('revertFiles worktree appliqué : revert dans le workspace avec la base du worktree', async () => {
+    const claude = mainAdapter();
+    const codex = new FakeAdapter('codex', 'Codex', {
+      turns: [{ steps: [{ kind: 'write', path: 'src/wt.ts', content: 'wt\n' }] }],
+    });
+    const o = build({ claude, codex });
+    await o.init();
+
+    const main = await o.startMainThread({ agent: 'claude', prompt: 'main', permissionMode: 'edit' });
+    await o.waitThread(main.id, 10);
+    const sub = await o.delegate(main.id, {
+      agent: 'codex',
+      prompt: 'wt',
+      mode: 'edit',
+      isolation: 'worktree',
+    });
+    await o.waitThread(sub.id, 10);
+
+    const merged = await o.mergeThread(sub.id);
+    expect(merged.status).toBe('applied');
+    expect(fs.existsSync(path.join(repoDir, 'src', 'wt.ts'))).toBe(true);
+    const headBefore = (await git(repoDir, ['rev-parse', 'HEAD'])).stdout.trim();
+
+    await o.revertFiles(sub.id, ['src/wt.ts']);
+
+    expect(fs.existsSync(path.join(repoDir, 'src', 'wt.ts'))).toBe(false);
+    expect((await git(repoDir, ['rev-parse', 'HEAD'])).stdout.trim()).toBe(headBefore);
+    expect((await git(repoDir, ['diff', '--cached', '--name-only'])).stdout.trim()).toBe('');
+  });
+
+  it('revertFiles refuse un thread en cours', async () => {
+    const claude = mainAdapter();
+    const gate = deferred();
+    claude.gate = gate.promise;
+    const o = build({ claude });
+    await o.init();
+
+    const main = await o.startMainThread({ agent: 'claude', prompt: 'long', permissionMode: 'edit' });
+    await expect(o.revertFiles(main.id, ['README.md'])).rejects.toThrow(
+      /est en cours : interrompez-le avant d'annuler des modifications/,
+    );
+
+    gate.resolve();
+    await o.waitThread(main.id, 10);
+  });
+
+  it('revertFiles refuse un fichier non modifié par le thread', async () => {
+    const claude = mainAdapter();
+    const codex = new FakeAdapter('codex', 'Codex', {
+      turns: [{ steps: [{ kind: 'write', path: 'src/a.ts', content: 'a\n' }] }],
+    });
+    const o = build({ claude, codex });
+    await o.init();
+
+    const main = await o.startMainThread({ agent: 'claude', prompt: 'main', permissionMode: 'edit' });
+    await o.waitThread(main.id, 10);
+    const sub = await o.delegate(main.id, {
+      agent: 'codex',
+      prompt: 'sub',
+      mode: 'edit',
+      isolation: 'shared',
+      scope: ['src/**'],
+    });
+    await o.waitThread(sub.id, 10);
+
+    await expect(o.revertFiles(sub.id, ['README.md'])).rejects.toThrow(
+      /README\.md n'a pas été modifié par ce thread/,
+    );
+  });
+
+  it('revertFiles : thread inconnu', async () => {
+    const claude = mainAdapter();
+    const o = build({ claude });
+    await o.init();
+    await expect(o.revertFiles('inconnu', ['README.md'])).rejects.toThrow(/Thread introuvable/);
+  });
+});

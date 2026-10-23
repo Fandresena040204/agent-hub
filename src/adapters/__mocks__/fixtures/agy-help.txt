@@ -1,0 +1,26 @@
+Antigravity CLI (fixture de test, format supposé)
+
+Usage: agy [OPTIONS] -p <prompt>
+
+Commands:
+  models    List available models
+
+Options:
+  -p, --prompt <prompt>
+          Prompt à exécuter.
+      --output-format <format>
+          Format de sortie : text | stream-json.
+      --non-interactive
+          Désactive l'interface interactive.
+  -m, --model <model>
+          Modèle à utiliser. Valeurs : gemini-3-pro, gemini-3-flash, claude-sonnet-4-5
+      --mode <mode>
+          mode : plan | accept-edits
+      --effort <level>
+          Niveau d'effort : low, medium, high
+      --resume <sessionId>
+          Reprendre une session existante.
+      --mcp-config <json>
+          Configuration MCP au format Claude Code.
+      --disallowed-tools <tools...>
+          Outils interdits.

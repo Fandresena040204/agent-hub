@@ -1,0 +1,2 @@
+{"type":"step_start","sessionID":"ses_err","part":{}}
+{"type":"error","sessionID":"ses_err","part":{"error":{"message":"boom"}}}
