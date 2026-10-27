@@ -90,7 +90,12 @@ export interface OrchestratorApi {
   startMainThread(req: MainThreadRequest): Promise<ThreadInfo>;
   /** Lève une Error au message explicite (modèle/effort invalide, scope en conflit, limite de threads…). */
   delegate(parentId: string, req: DelegateRequest): Promise<ThreadInfo>;
-  sendMessage(threadId: string, text: string): Promise<void>;
+  /**
+   * Message de suivi. `from: 'user'` (défaut) est refusé sur un thread délégué quand les threads enfants sont
+   * en lecture seule (réglage agentHub.delegation.readOnlyChildren, vrai par défaut) ; l'agent principal
+   * (outil MCP message_thread) passe `from: 'agent'`.
+   */
+  sendMessage(threadId: string, text: string, opts?: { from?: 'user' | 'agent' }): Promise<void>;
   /**
    * Change l'agent, le modèle ou l'effort d'un thread inactif, en gardant le même thread
    * (id, historique, threads délégués, jeton MCP). Même CLI : reprise de la session native ;

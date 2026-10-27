@@ -1,0 +1,16 @@
+# Le bundle esbuild (dist/) contient tout le code : on n'embarque ni les sources ni les tests.
+src/**
+test/**
+test-integration/**
+out-integration/**
+.vscode/**
+.vscode-test/**
+docs/_*.txt
+**/*.map
+node_modules/**
+esbuild.mjs
+tsconfig.json
+vitest.config.ts
+.gitignore
+.gitattributes
+*.vsix

@@ -20,6 +20,8 @@ export type AgentEvent =
   | { type: 'commit_violation'; oldHead: string; newHead: string }
   | { type: 'commit_made'; sha: string; message: string; paths: string[] }
   | { type: 'agent_switched'; from: AgentRef; to: AgentRef; mode: 'resume' | 'handoff' }
+  /** Émis dans le thread PARENT quand il délègue : l'UI y affiche la carte (vivante) du sous-agent. */
+  | { type: 'subagent_started'; threadId: string }
   | { type: 'done'; summary: string }
   | { type: 'error'; message: string };
 

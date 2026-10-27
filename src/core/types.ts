@@ -70,4 +70,8 @@ export interface ThreadInfo {
   agentHistory?: AgentSegment[];
   summary?: string;
   error?: string;
+  /** Dernière activité lisible (début de la dernière réponse ou « outil <nom> »), pour les cartes de sous-agents. */
+  lastActivity?: string;
+  /** Fin du dernier tour (done/error/interrupted), pour la durée affichée. */
+  finishedAt?: number;
 }

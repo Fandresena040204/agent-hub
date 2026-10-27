@@ -140,7 +140,7 @@
         },
         {
           "command": "agentHub.changeAgent",
-          "when": "view == agentHub.threads && viewItem =~ /thread (idle|finished)/",
+          "when": "view == agentHub.threads && viewItem =~ /thread (idle|finished) main/",
           "group": "thread@2"
         }
       ]
@@ -222,6 +222,11 @@
           "default": [],
           "description": "Agents que l'agent principal peut choisir pour déléguer (vide = tous)."
         },
+        "agentHub.delegation.readOnlyChildren": {
+          "type": "boolean",
+          "default": true,
+          "description": "Threads délégués en lecture seule : on écrit au thread principal, qui pilote ses sous-agents."
+        },
         "agentHub.delegation.maxActiveThreads": {
           "type": "number",
           "default": 3
@@ -273,7 +278,9 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "build:integration": "esbuild test-integration/runTest.ts test-integration/suite.ts --bundle --platform=node --format=cjs --target=node20 --external:vscode --outdir=out-integration --log-level=warning",
-    "test:vscode": "npm run build && npm run build:integration && node out-integration/runTest.js"
+    "test:vscode": "npm run build && npm run build:integration && node out-integration/runTest.js",
+    "vscode:prepublish": "npm run build",
+    "package": "vsce package --no-dependencies"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
