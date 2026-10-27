@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { ClaudeAdapter } from '../src/adapters/claude';
 import {
@@ -164,6 +165,7 @@ describe('sessions Claude — conversion des événements', () => {
   it('lit la fixture sans aucun chemin personnel', () => {
     // Garde-fou : les fixtures du dépôt ne contiennent aucune donnée réelle.
     const raw = readFixture(ID_RECENT) + readFixture(ID_OLD);
-    expect(raw).not.toContain('fandr');
+    expect(raw).not.toContain(os.homedir());
+    expect(raw).not.toContain(os.userInfo().username);
   });
 });
