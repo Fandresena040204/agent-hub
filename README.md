@@ -34,6 +34,15 @@ Un CLI absent n'empêche rien : il apparaît comme indisponible, avec un message
 6. La vue **Fichiers modifiés** liste les fichiers du thread sélectionné ; un clic ouvre le diff par rapport à l'état de base propre à ce thread.
 7. Threads `worktree` terminés (menu contextuel) : **Voir le diff**, **Appliquer** (applique au workspace, sans commit), **Supprimer le worktree**.
 
+### Importer et supprimer des sessions
+
+- **Importer une session** (bouton ⤓ de la vue Threads ou du chat, commande « Agent Hub: Importer une session ») : choisir l'agent puis une session native existante **de ce dossier**. Elle devient un thread principal avec tout son historique, et le prochain message **reprend la session native** du CLI (`--resume` / `--session`). Une session déjà suivie n'est pas importée deux fois.
+  - Claude Code : `~/.claude/projects/<dossier encodé>/*.jsonl` (ou `CLAUDE_CONFIG_DIR`).
+  - OpenCode : `opencode session list` / `opencode session export`.
+  - Codex : `~/.codex/sessions/**/rollout-*.jsonl` (format non vérifié, Codex n'étant pas installé pendant le développement).
+  - Antigravity (`agy`) : pas encore pris en charge.
+- **Supprimer un thread** (menu contextuel ou 🗑 dans le chat) : supprime le thread d'Agent Hub et, pour un thread principal, ses threads délégués (interrompus s'ils tournent, worktrees supprimés). La **session native du CLI n'est pas supprimée**.
+
 ### Outils MCP exposés à l'agent principal
 
 `list_agents`, `delegate`, `read_thread`, `message_thread`, `wait_thread`, `list_threads`, `interrupt_thread`, `merge_thread`, `commit`.

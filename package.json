@@ -2,7 +2,7 @@
   "name": "agent-hub",
   "displayName": "Agent Hub",
   "description": "Pilote plusieurs agents de codage (Claude Code, Codex, OpenCode, Antigravity) avec délégation.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "local",
   "license": "MIT",
   "engines": {
@@ -102,12 +102,27 @@
       {
         "command": "agentHub.focusChat",
         "title": "Agent Hub: Afficher le chat"
+      },
+      {
+        "command": "agentHub.deleteThread",
+        "title": "Agent Hub: Supprimer le thread",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "agentHub.importSession",
+        "title": "Agent Hub: Importer une session (Claude Code, Codex, OpenCode…)",
+        "icon": "$(cloud-download)"
       }
     ],
     "menus": {
       "view/title": [
         {
           "command": "agentHub.newMainThread",
+          "when": "view == agentHub.threads",
+          "group": "navigation"
+        },
+        {
+          "command": "agentHub.importSession",
           "when": "view == agentHub.threads",
           "group": "navigation"
         }
@@ -142,6 +157,11 @@
           "command": "agentHub.changeAgent",
           "when": "view == agentHub.threads && viewItem =~ /thread (idle|finished) main/",
           "group": "thread@2"
+        },
+        {
+          "command": "agentHub.deleteThread",
+          "when": "view == agentHub.threads && viewItem =~ /^thread /",
+          "group": "z-delete@1"
         }
       ]
     },

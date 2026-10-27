@@ -1,9 +1,10 @@
 // Adaptateur Claude Code : `claude -p … --output-format stream-json --verbose`.
 
-import type { AgentCapabilities, AgentAdapter, AgentRun, StartOptions } from './AgentAdapter';
+import type { AgentCapabilities, AgentAdapter, AgentRun, StartOptions, NativeSession, NativeSessionContent } from './AgentAdapter';
 import { InvalidOptionError } from './AgentAdapter';
 import type { AgentId } from '../core/types';
 import { runCli } from './process';
+import { listClaudeSessions, readClaudeSession } from './sessions/claudeSessions';
 import {
   CliAgentRun,
   TurnContext,
@@ -243,5 +244,15 @@ export class ClaudeAdapter implements AgentAdapter {
       if (opts.allowedPaths !== undefined) env.AGENT_HUB_ALLOWED_PATHS = JSON.stringify(opts.allowedPaths);
     }
     return new ClaudeRun(this.cfg, opts, env, () => this.getCapabilities());
+  }
+
+  /** Sessions natives du dossier (fichiers JSONL de `~/.claude/projects`). */
+  listSessions(cwd: string): Promise<NativeSession[]> {
+    return listClaudeSessions(cwd);
+  }
+
+  /** Historique d'une session native converti en événements communs. */
+  readSession(sessionId: string, cwd: string): Promise<NativeSessionContent> {
+    return readClaudeSession(sessionId, cwd);
   }
 }

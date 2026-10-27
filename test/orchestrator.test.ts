@@ -2,8 +2,15 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { Orchestrator, type OrchestratorConfig } from '../src/core/Orchestrator';
-import type { AgentAdapter, AgentCapabilities, AgentRun, StartOptions } from '../src/adapters/AgentAdapter';
+import { Orchestrator, type McpBinding, type OrchestratorConfig } from '../src/core/Orchestrator';
+import type {
+  AgentAdapter,
+  AgentCapabilities,
+  AgentRun,
+  NativeSession,
+  NativeSessionContent,
+  StartOptions,
+} from '../src/adapters/AgentAdapter';
 import type { AgentEvent } from '../src/core/events';
 import { AsyncQueue } from '../src/adapters/process';
 import { ThreadStore } from '../src/core/ThreadStore';
@@ -27,6 +34,12 @@ interface FakeOptions {
   detail?: string;
   caps?: AgentCapabilities;
   turns?: Turn[];
+  /** Présent = l'adaptateur sait lister les sessions natives. */
+  sessions?: NativeSession[];
+  /** Contenu par session native ; absent = session vide. */
+  contents?: Record<string, NativeSessionContent>;
+  /** Simule un CLI qui échoue à lister ses sessions. */
+  listSessionsError?: string;
 }
 
 const DEFAULT_CAPS: AgentCapabilities = {
@@ -37,6 +50,9 @@ const DEFAULT_CAPS: AgentCapabilities = {
 class FakeAdapter implements AgentAdapter {
   readonly received: string[] = [];
   readonly starts: StartOptions[] = [];
+  readonly readCalls: string[] = [];
+  listSessions?: (cwd: string) => Promise<NativeSession[]>;
+  readSession?: (sessionId: string, cwd: string) => Promise<NativeSessionContent>;
   gate?: Promise<void>;
   private turns: Turn[];
 
@@ -46,6 +62,16 @@ class FakeAdapter implements AgentAdapter {
     private readonly opts: FakeOptions = {},
   ) {
     this.turns = [...(opts.turns ?? [])];
+    if (opts.sessions) {
+      this.listSessions = async (cwd: string) => {
+        if (opts.listSessionsError) throw new Error(opts.listSessionsError);
+        return opts.sessions!.map((s) => ({ ...s, cwd: s.cwd ?? cwd }));
+      };
+      this.readSession = async (sessionId: string) => {
+        this.readCalls.push(sessionId);
+        return opts.contents?.[sessionId] ?? { events: [] };
+      };
+    }
   }
 
   async isAvailable(): Promise<{ ok: boolean; detail?: string }> {
@@ -127,6 +153,34 @@ async function createRepo(): Promise<string> {
 }
 
 const ACTIVE = ['starting', 'running'];
+
+const MCP_URL = 'http://127.0.0.1:4321/mcp';
+
+/** Faux binding MCP : jetons stables par thread et trace des révocations. */
+function mcpBinding(): { binding: McpBinding; tokens: Map<string, string>; unregistered: string[] } {
+  const tokens = new Map<string, string>();
+  const unregistered: string[] = [];
+  let n = 0;
+  return {
+    tokens,
+    unregistered,
+    binding: {
+      url: () => MCP_URL,
+      registerMainThread: (id: string) => {
+        let token = tokens.get(id);
+        if (!token) {
+          token = `jeton-${++n}`;
+          tokens.set(id, token);
+        }
+        return token;
+      },
+      unregister: (id: string) => {
+        unregistered.push(id);
+        tokens.delete(id);
+      },
+    },
+  };
+}
 
 describe('Orchestrator', () => {
   let repoDir: string;
@@ -1212,5 +1266,298 @@ describe('Orchestrator', () => {
     const o = build({ claude });
     await o.init();
     await expect(o.revertFiles('inconnu', ['README.md'])).rejects.toThrow(/Thread introuvable/);
+  });
+
+  // ── Import de sessions natives ─────────────────────────────────────────
+
+  const NATIVE_CONTENT: NativeSessionContent = {
+    title: 'Session native',
+    model: 'm2',
+    effort: 'high',
+    events: [
+      { ts: 1_000, event: { type: 'user_text', text: 'Objectif importé' } },
+      { ts: 2_000, event: { type: 'assistant_text', text: 'Réponse native', partial: false } },
+      { ts: 3_000, event: { type: 'tool_call', id: 't1', name: 'read_file', input: {} } },
+    ],
+  };
+
+  function importingAdapter(extra: Partial<FakeOptions> = {}): FakeAdapter {
+    return new FakeAdapter('claude', 'Claude', {
+      sessions: [{ id: 'native-1', title: 'Session native', updatedAt: 3_000 }],
+      contents: { 'native-1': NATIVE_CONTENT },
+      turns: [{ steps: [] }],
+      ...extra,
+    });
+  }
+
+  it('listImportableSessions : agent absent, sans listSessions, indisponible ou en échec', async () => {
+    const claude = mainAdapter();
+    const codex = new FakeAdapter('codex', 'Codex', { available: false, detail: 'CLI absent', sessions: [] });
+    const opencode = new FakeAdapter('opencode', 'OpenCode', {
+      sessions: [],
+      listSessionsError: 'dossier illisible',
+    });
+    const o = build({ claude, codex, opencode });
+    await o.init();
+
+    await expect(o.listImportableSessions('agy')).rejects.toThrow('Agent agy non configuré.');
+    await expect(o.listImportableSessions('claude')).rejects.toThrow(
+      "L'import de sessions n'est pas encore pris en charge pour Claude.",
+    );
+    await expect(o.importSession('claude', 'native-1')).rejects.toThrow(
+      "L'import de sessions n'est pas encore pris en charge pour Claude.",
+    );
+    await expect(o.listImportableSessions('codex')).rejects.toThrow(/Agent codex indisponible : CLI absent/);
+    await expect(o.listImportableSessions('opencode')).rejects.toThrow(
+      /Sessions OpenCode indisponibles : dossier illisible/,
+    );
+  });
+
+  it('listImportableSessions : marque les sessions déjà suivies (créée par Agent Hub et importée)', async () => {
+    const claude = new FakeAdapter('claude', 'Claude', {
+      sessions: [
+        { id: 'sess-claude-1', title: 'Créée par Agent Hub', updatedAt: 3 },
+        { id: 'native-2', title: 'Importée', updatedAt: 2 },
+        { id: 'libre', title: 'Libre', updatedAt: 1 },
+      ],
+      contents: {
+        'native-2': { title: 'Importée', events: [{ ts: 5, event: { type: 'user_text', text: 'salut' } }] },
+      },
+    });
+    const o = build({ claude });
+    await o.init();
+
+    const main = await o.startMainThread({ agent: 'claude', prompt: 'main', permissionMode: 'edit' });
+    await o.waitThread(main.id, 10);
+    expect(main.sessionId).toBe('sess-claude-1');
+    const imported = await o.importSession('claude', 'native-2');
+
+    const sessions = await o.listImportableSessions('claude');
+    expect(sessions.map((s) => s.id)).toEqual(['sess-claude-1', 'native-2', 'libre']);
+    expect(sessions[0].importedThreadId).toBe(main.id);
+    expect(sessions[1].importedThreadId).toBe(imported.id);
+    expect(sessions[2].importedThreadId).toBeUndefined();
+  });
+
+  it('importSession : thread principal idle, historique horodaté, segment import, message final', async () => {
+    const claude = importingAdapter();
+    const o = build({ claude });
+    await o.init();
+
+    const notified: number[] = [];
+    o.onDidAppendEvent((id, stored) => {
+      expect(id).toBeTypeOf('string');
+      notified.push(stored.ts);
+    });
+
+    const thread = await o.importSession('claude', 'native-1');
+    expect(thread.parentId).toBeUndefined();
+    expect(thread.status).toBe('idle');
+    expect(thread.agent).toBe('claude');
+    expect(thread.model).toBe('m2');
+    expect(thread.effort).toBe('high');
+    expect(thread.sessionId).toBe('native-1');
+    expect(thread.permissionMode).toBe('edit');
+    expect(thread.isolation).toBe('shared');
+    expect(thread.cwd).toBe(repoDir);
+    expect(thread.title).toBe('Session native');
+    expect(thread.createdAt).toBe(1_000);
+    expect(thread.agentHistory).toMatchObject([
+      { agent: 'claude', model: 'm2', effort: 'high', sessionId: 'native-1', since: 1_000, mode: 'import' },
+    ]);
+    // Aucun tour lancé : la session native reprendra au prochain message.
+    expect(claude.starts).toHaveLength(0);
+
+    const stored = o.getEvents(thread.id);
+    expect(stored).toHaveLength(4);
+    expect(stored.slice(0, 3).map((e) => e.ts)).toEqual([1_000, 2_000, 3_000]);
+    expect(stored.slice(0, 3).map((e) => e.event)).toEqual(NATIVE_CONTENT.events.map((e) => e.event));
+    expect(stored[3].event).toEqual({
+      type: 'assistant_text',
+      text: '[Agent Hub] Session Claude importée (native-1). Le prochain message reprend cette session.',
+      partial: false,
+    });
+    expect(notified.slice(0, 3)).toEqual([1_000, 2_000, 3_000]);
+    expect(notified).toHaveLength(4);
+    expect(store.loadThreads().find((t) => t.id === thread.id)?.status).toBe('idle');
+
+    // Second import de la même session : même thread, aucune relecture.
+    const again = await o.importSession('claude', 'native-1');
+    expect(again.id).toBe(thread.id);
+    expect(claude.readCalls).toEqual(['native-1']);
+    expect(o.getEvents(thread.id)).toHaveLength(4);
+  });
+
+  it('importSession : titre repris du premier user_text à défaut de titre', async () => {
+    const claude = new FakeAdapter('claude', 'Claude', {
+      sessions: [{ id: 'sans-titre', title: '', updatedAt: 10 }],
+      contents: {
+        'sans-titre': {
+          events: [{ ts: 10, event: { type: 'user_text', text: '  Corrige   le bug  ' } }],
+        },
+      },
+    });
+    const o = build({ claude });
+    await o.init();
+
+    const thread = await o.importSession('claude', 'sans-titre');
+    expect(thread.title).toBe('Corrige le bug');
+    expect(thread.model).toBeUndefined();
+    expect(thread.createdAt).toBe(10);
+  });
+
+  it('importSession : le message suivant reprend la session native avec le serveur MCP principal', async () => {
+    const claude = importingAdapter();
+    const o = build({ claude });
+    const mcp = mcpBinding();
+    o.setMcp(mcp.binding);
+    await o.init();
+
+    const thread = await o.importSession('claude', 'native-1');
+    await o.sendMessage(thread.id, 'continue');
+    await o.waitThread(thread.id, 10);
+
+    const start = claude.starts[0];
+    expect(start.sessionId).toBe('native-1');
+    expect(start.mcpServerUrl).toBe(MCP_URL);
+    expect(start.mcpToken).toBe(mcp.tokens.get(thread.id));
+    expect(start.systemPromptAppend).toContain('agent principal');
+    expect(start.permissionMode).toBe('edit');
+    expect(start.gitPolicy.role).toBe('main');
+    expect(o.getThread(thread.id)!.sessionId).toBe('native-1');
+    expect(o.getThread(thread.id)!.status).toBe('idle');
+  });
+
+  it('sendMessage après rechargement depuis le disque : session et jeton MCP conservés', async () => {
+    const claude = mainAdapter();
+    const first = build({ claude });
+    const mcp1 = mcpBinding();
+    first.setMcp(mcp1.binding);
+    await first.init();
+    const main = await first.startMainThread({ agent: 'claude', prompt: 'main', permissionMode: 'edit' });
+    await first.waitThread(main.id, 10);
+    await first.dispose();
+
+    const claude2 = mainAdapter();
+    const second = build({ claude: claude2 });
+    const mcp2 = mcpBinding();
+    second.setMcp(mcp2.binding);
+    await second.init();
+
+    await second.sendMessage(main.id, 'reprends');
+    await second.waitThread(main.id, 10);
+
+    const start = claude2.starts[0];
+    expect(start.sessionId).toBe('sess-claude-1');
+    expect(start.mcpServerUrl).toBe(MCP_URL);
+    expect(start.mcpToken).toBe(mcp2.tokens.get(main.id));
+    expect(start.systemPromptAppend).toContain('agent principal');
+  });
+
+  // ── Suppression de threads ─────────────────────────────────────────────
+
+  it('deleteThread : principal avec deux enfants (en cours, worktree) → tout est supprimé', async () => {
+    const claude = mainAdapter();
+    const codex = new FakeAdapter('codex', 'Codex', {
+      turns: [{ steps: [{ kind: 'write', path: 'src/wt.ts', content: 'wt' }] }, { steps: [] }],
+    });
+    const o = build({ claude, codex });
+    const mcp = mcpBinding();
+    o.setMcp(mcp.binding);
+    await o.init();
+
+    const main = await o.startMainThread({ agent: 'claude', prompt: 'main', permissionMode: 'edit' });
+    await o.waitThread(main.id, 10);
+    expect(mcp.tokens.get(main.id)).toBeDefined();
+
+    const wtChild = await o.delegate(main.id, {
+      agent: 'codex',
+      prompt: 'worktree',
+      mode: 'edit',
+      isolation: 'worktree',
+    });
+    await o.waitThread(wtChild.id, 10);
+    const wtPath = o.getThread(wtChild.id)!.worktreePath!;
+    expect(fs.existsSync(wtPath)).toBe(true);
+
+    const gate = deferred();
+    codex.gate = gate.promise;
+    const runningChild = await o.delegate(main.id, {
+      agent: 'codex',
+      prompt: 'long',
+      mode: 'edit',
+      isolation: 'shared',
+      scope: ['src/**'],
+    });
+    expect(ACTIVE).toContain(o.getThread(runningChild.id)!.status);
+
+    const removed: string[] = [];
+    // Un callback fautif ne doit pas empêcher les autres notifications.
+    o.onDidRemoveThread(() => {
+      throw new Error('callback cassé');
+    });
+    o.onDidRemoveThread((id) => removed.push(id));
+
+    await o.deleteThread(main.id);
+    gate.resolve();
+
+    for (const id of [main.id, wtChild.id, runningChild.id]) {
+      expect(o.getThread(id)).toBeUndefined();
+      expect(o.listThreads().some((t) => t.id === id)).toBe(false);
+      expect(store.loadThreads().some((t) => t.id === id)).toBe(false);
+      expect(store.loadEvents(id)).toEqual([]);
+    }
+    expect(removed).toEqual([wtChild.id, runningChild.id, main.id]);
+    expect(fs.existsSync(wtPath)).toBe(false);
+    expect(mcp.unregistered).toContain(main.id);
+    expect(mcp.tokens.has(main.id)).toBe(false);
+
+    // Verrou de scope libéré : une nouvelle délégation sur le même scope passe.
+    const other = await o.startMainThread({ agent: 'claude', prompt: 'autre', permissionMode: 'edit' });
+    await o.waitThread(other.id, 10);
+    codex.gate = undefined;
+    const again = await o.delegate(other.id, {
+      agent: 'codex',
+      prompt: 'reprise',
+      mode: 'edit',
+      isolation: 'shared',
+      scope: ['src/**'],
+    });
+    const done = await o.waitThread(again.id, 10);
+    expect(done.status).toBe('done');
+  });
+
+  it('deleteThread : un enfant seul laisse le parent et son historique intacts', async () => {
+    const claude = mainAdapter();
+    const codex = new FakeAdapter('codex', 'Codex', { turns: [{ steps: [] }, { steps: [] }] });
+    const o = build({ claude, codex });
+    await o.init();
+
+    const main = await o.startMainThread({ agent: 'claude', prompt: 'main', permissionMode: 'edit' });
+    await o.waitThread(main.id, 10);
+    const sub = await o.delegate(main.id, { agent: 'codex', prompt: 'sub', mode: 'readonly' });
+    await o.waitThread(sub.id, 10);
+
+    const parentEvents = o.getEvents(main.id);
+    expect(parentEvents.some((e) => e.event.type === 'subagent_started')).toBe(true);
+    const removed: string[] = [];
+    o.onDidRemoveThread((id) => removed.push(id));
+
+    await o.deleteThread(sub.id);
+
+    expect(o.getThread(sub.id)).toBeUndefined();
+    expect(o.getThread(main.id)).toBeDefined();
+    // La carte « thread supprimé » s'appuie sur l'historique du parent, laissé tel quel.
+    expect(o.getEvents(main.id)).toEqual(parentEvents);
+    expect(removed).toEqual([sub.id]);
+    expect(store.loadEvents(sub.id)).toEqual([]);
+
+    // Le parent reste utilisable.
+    await o.sendMessage(main.id, 'suite');
+    await o.waitThread(main.id, 10);
+    expect(o.getThread(main.id)!.status).toBe('idle');
+    expect(claude.received).toEqual(['main', 'suite']);
+
+    await expect(o.deleteThread('inconnu')).rejects.toThrow(/Thread introuvable/);
   });
 });

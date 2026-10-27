@@ -7,14 +7,15 @@ import type { ThreadInfo } from '../core/types';
 import { createLogger } from '../core/log';
 import { baseContentUri } from './ChangesView';
 import {
-  breaksSubagentGroup, buildChatHtml, getNonce, groupHeaderText, isThreadRunning, lineageHtml, renderEventHtml,
+  breaksSubagentGroup, buildChatHtml, getNonce, isThreadRunning, lineageHtml, renderEventHtml,
   renderEventPatch, threadStatusText,
 } from './presentation';
 import {
   cardsBlockHtml, chatThreadOptions, fileSignature, filesTotals, pendingFiles, readOnlyForThread,
-  renderFilesBlockHtml, threadSubtitle,
+  renderFilesBlockHtml, subagentGroupHeaderText, threadSubtitle,
 } from './chatViewModel';
-import type { FilesTotals, SubagentCardDatum } from './chatViewModel';
+import type { FilesTotals, SubagentCardMember } from './chatViewModel';
+import { fallbackThreadAfterRemoval } from './threadLifecycle';
 
 const log = createLogger('ui.chatview');
 
@@ -87,6 +88,10 @@ export class ChatView implements vscode.WebviewViewProvider {
   private groupMembers = new Map<string, { id: string; blockId: string }[]>();
   /** Sous-agents affichés en carte : threadId -> id de groupe (mise à jour en direct). */
   private cardGroups = new Map<string, string>();
+  /** Sous-agents dont le thread a été supprimé (cartes grisées) pour le thread affiché. */
+  private removedCards = new Set<string>();
+  /** Parent du thread affiché (repli après suppression). */
+  private currentParent: string | undefined;
   /** Totaux de fichiers connus par sous-agent (cache des reconstructions). */
   private cardTotals = new Map<string, FilesTotals>();
   /** Dernière carte envoyée par sous-agent : déduplication (html + en-tête de groupe). */
@@ -116,6 +121,8 @@ export class ChatView implements vscode.WebviewViewProvider {
       view.onDidDispose(() => this.detach()),
       asDisposable(this.orch.onDidAppendEvent((tid, stored) => this.onEvent(tid, stored))),
       asDisposable(this.orch.onDidChangeThread((t) => this.onThreadChanged(t))),
+      // Thread supprimé : repli de la vue, purge du bloc fichiers et cartes grisées.
+      asDisposable(this.orch.onDidRemoveThread((tid) => this.onThreadRemoved(tid))),
       // Réglage de lecture seule des enfants : l'en-tête pilote bandeau et zone de saisie.
       vscode.workspace.onDidChangeConfiguration((e) => {
         if (e.affectsConfiguration('agentHub.delegation.readOnlyChildren')) this.postHeader();
@@ -161,6 +168,7 @@ export class ChatView implements vscode.WebviewViewProvider {
   private selectThread(threadId: string, focus: boolean): void {
     if (!threadId) return;
     this.currentId = threadId;
+    this.currentParent = this.orch.getThread(threadId)?.parentId;
     void this.ctx.workspaceState.update(CURRENT_KEY, threadId);
     this.pending = [];
     this.openPartial = null;
@@ -171,6 +179,31 @@ export class ChatView implements vscode.WebviewViewProvider {
     if (this.ready) this.onReady();
   }
 
+  /** Retour à l'écran d'accueil (thread courant supprimé et aucun thread restant). */
+  private clearThread(): void {
+    this.currentId = undefined;
+    this.currentParent = undefined;
+    void this.ctx.workspaceState.update(CURRENT_KEY, undefined);
+    this.pending = [];
+    this.openPartial = null;
+    this.lastFiles = [];
+    if (this.ready) this.onReady();
+  }
+
+  /** Thread supprimé : la vue bascule (parent > principal le plus récent > accueil) ou grise ses cartes. */
+  private onThreadRemoved(threadId: string): void {
+    if (threadId === this.currentId) {
+      const fallback = fallbackThreadAfterRemoval(this.orch.listThreads(), this.currentParent, threadId);
+      if (fallback) this.selectThread(fallback, false);
+      else this.clearThread();
+      return;
+    }
+    // Sous-agent affiché en carte dans le thread courant : version grisée « Sous-agent supprimé ».
+    if (!this.cardGroups.has(threadId)) return;
+    this.removedCards.add(threadId);
+    void this.sendCard(threadId);
+  }
+
   // ---------------------------------------------------------------- cartes de sous-agents
 
   /** Vidage complet des structures de cartes (changement de thread ou fermeture). */
@@ -178,6 +211,7 @@ export class ChatView implements vscode.WebviewViewProvider {
     this.resetCardRender();
     this.cardTotals.clear();
     this.lastCardPost.clear();
+    this.removedCards.clear();
   }
 
   /** Début d'une reconstruction : rendu repart de zéro, les caches (totaux) restent. */
@@ -193,8 +227,9 @@ export class ChatView implements vscode.WebviewViewProvider {
 
   /** Enregistre la carte d'un sous-agent dans le groupe ouvert et pousse son rendu. */
   private appendSubagent(threadId: string, blockId: string, live: boolean): void {
+    const removed = this.removedCards.has(threadId);
     const child = this.orch.getThread(threadId);
-    if (!child) return; // thread inconnu : aucune carte visible
+    if (!child && !removed) return; // thread inconnu : aucune carte visible
     if (!this.openGroup) {
       const anchorIndex = live ? -1 : this.blocks.length;
       this.openGroup = { groupId: `sg-${blockId}`, block0: blockId, members: [], anchorIndex };
@@ -217,10 +252,14 @@ export class ChatView implements vscode.WebviewViewProvider {
     this.scheduleCard(threadId); // totaux de fichiers (asynchrone)
   }
 
-  /** Données de cartes des membres (threads vivants seulement). */
-  private cardData(members: { id: string; blockId: string }[]): SubagentCardDatum[] {
-    const out: SubagentCardDatum[] = [];
+  /** Données de cartes des membres (threads vivants, plus ceux supprimés → carte grisée). */
+  private cardData(members: { id: string; blockId: string }[]): SubagentCardMember[] {
+    const out: SubagentCardMember[] = [];
     for (const m of members) {
+      if (this.removedCards.has(m.id)) {
+        out.push({ blockId: m.blockId, removedId: m.id });
+        continue;
+      }
       const t = this.orch.getThread(m.id);
       if (t) out.push({ thread: t, blockId: m.blockId, totals: this.cardTotals.get(m.id) });
     }
@@ -244,6 +283,7 @@ export class ChatView implements vscode.WebviewViewProvider {
     const members = this.groupMembers.get(groupId) ?? [];
     const me = members.find((m) => m.id === threadId);
     if (!me) return;
+    const removed = this.removedCards.has(threadId);
     try {
       const files = await this.orch.changedFiles(threadId);
       this.cardTotals.set(threadId, filesTotals(files));
@@ -252,20 +292,23 @@ export class ChatView implements vscode.WebviewViewProvider {
     }
     if (!this.ready || this.currentId !== viewed || this.cardGroups.get(threadId) !== groupId) return;
     const thread = this.orch.getThread(threadId);
-    if (!thread) return;
-    const html = cardsBlockHtml(
-      [{ thread, blockId: me.blockId, totals: this.cardTotals.get(threadId) }],
-      groupId,
-    ).html;
+    if (!thread && !removed) return;
+    // Carte vivante, ou grisée si le thread a été supprimé entre-temps.
+    const member: SubagentCardMember = thread
+      ? { thread, blockId: me.blockId, totals: this.cardTotals.get(threadId) }
+      : { blockId: me.blockId, removedId: threadId };
+    const html = cardsBlockHtml([member], groupId).html;
     let header: string | undefined;
     let gid: string | undefined;
     if (members.length >= 2) {
-      const threads: ThreadInfo[] = [];
+      const live: ThreadInfo[] = [];
+      let removedCount = 0;
       for (const m of members) {
+        if (this.removedCards.has(m.id)) { removedCount++; continue; }
         const t = this.orch.getThread(m.id);
-        if (t) threads.push(t);
+        if (t) live.push(t);
       }
-      header = groupHeaderText(threads);
+      header = subagentGroupHeaderText(live, removedCount);
       gid = groupId;
     }
     const key = `${header ?? ''}\u0000${html}`;
@@ -523,6 +566,8 @@ export class ChatView implements vscode.WebviewViewProvider {
       case 'applyThread': if (m.id) void vscode.commands.executeCommand('agentHub.applyWorktree', m.id); break;
       // Boutons délégués aux commandes globales (câblées dans extension.ts).
       case 'newThread': void vscode.commands.executeCommand('agentHub.newMainThread'); break;
+      case 'importSession': void vscode.commands.executeCommand('agentHub.importSession'); break;
+      case 'deleteThread': if (this.currentId) void vscode.commands.executeCommand('agentHub.deleteThread', this.currentId); break;
       case 'delegate': if (this.currentId) void vscode.commands.executeCommand('agentHub.delegateManual', this.currentId); break;
       case 'changeAgent': if (this.currentId) void vscode.commands.executeCommand('agentHub.changeAgent', this.currentId); break;
       case 'apply': if (this.currentId) void vscode.commands.executeCommand('agentHub.applyWorktree', this.currentId); break;

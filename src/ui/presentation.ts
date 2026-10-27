@@ -213,6 +213,7 @@ const AGENT_MODE_TEXT: Record<AgentSegment['mode'], string> = {
   start: 'démarrage',
   resume: 'session reprise',
   handoff: 'passation',
+  import: 'session importée',
 };
 
 /** Texte neutre du bandeau de relais d'un `agent_switched`. */
@@ -533,6 +534,8 @@ const btnNew = document.getElementById('btnNew');
 const btnDel = document.getElementById('btnDelegate');
 const btnAg = document.getElementById('btnAgent');
 const btnStop = document.getElementById('btnStop');
+const btnImport = document.getElementById('btnImport');
+const btnDelThread = document.getElementById('btnDelThread');
 let running = false, hasThread = false, isMain = false, ro = false, mainId = '';
 function sync() {
   document.body.classList.toggle('empty', !hasThread);
@@ -548,6 +551,8 @@ function sync() {
   const roChild = hasThread && !isMain && ro;
   robar.hidden = !roChild;
   document.getElementById('vinput').style.display = roChild ? 'none' : '';
+  // Suppression : toujours disponible tant qu'un thread est affiché (la confirmation prévient).
+  btnDelThread.style.display = hasThread ? '' : 'none';
 }
 // Durée mm:ss d'une carte en cours (minuteur local, chaque seconde, à partir de data-start).
 function mmss(ms) {
@@ -623,10 +628,13 @@ ta.addEventListener('keydown', function (e) {
 sendB.addEventListener('click', () => { if (running) vs.postMessage({ t: 'stop' }); });
 sel.addEventListener('change', () => { if (sel.value) vs.postMessage({ t: 'selectThread', id: sel.value }); });
 btnNew.addEventListener('click', () => vs.postMessage({ t: 'newThread' }));
+btnImport.addEventListener('click', () => vs.postMessage({ t: 'importSession' }));
+btnDelThread.addEventListener('click', () => vs.postMessage({ t: 'deleteThread' }));
 btnDel.addEventListener('click', () => vs.postMessage({ t: 'delegate' }));
 btnAg.addEventListener('click', () => vs.postMessage({ t: 'changeAgent' }));
 btnStop.addEventListener('click', () => vs.postMessage({ t: 'stop' }));
 document.getElementById('wbtn').addEventListener('click', () => vs.postMessage({ t: 'newThread' }));
+document.getElementById('wimport').addEventListener('click', () => vs.postMessage({ t: 'importSession' }));
 // Fil d'Ariane : clic sur « ← parent » pour revenir au thread principal.
 lignee.addEventListener('click', function (e) {
   const b = e.target.closest('[data-id]');
@@ -711,6 +719,7 @@ body.empty #welcome { display: flex; }
 #welcome p { margin: 0; max-width: 34em; }
 #wbtn { background: var(--vscode-button-background); color: var(--vscode-button-foreground); padding: 5px 14px; }
 #wbtn:hover { background: var(--vscode-button-hoverBackground); }
+#wimport { background: var(--vscode-button-secondaryBackground, transparent); color: var(--vscode-button-secondaryForeground, var(--vscode-foreground, inherit)); padding: 5px 14px; }
 /* Fil d'Ariane des threads délégués : ← parent › enfant. */
 #lignee { display: flex; align-items: center; gap: 4px; padding: 3px 10px 0; font-size: 11px; color: var(--vscode-descriptionForeground); white-space: nowrap; overflow: hidden; }
 #lignee .lcrumb { background: transparent; color: var(--vscode-textLink-foreground); font-size: 11px; padding: 0 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 55%; }
@@ -742,6 +751,8 @@ body.empty #welcome { display: flex; }
 .sacard .sa-acts button:hover:not(:disabled) { background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,.18)); }
 .sacard .sa-acts button.apply { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
 .sacard .sa-acts button.apply:hover { background: var(--vscode-button-hoverBackground); }
+/* Carte grisée d'un sous-agent supprimé. */
+.sacard.sa-gone { opacity: .55; }
 /* Groupe de cartes : en-tête repliable « N sous-agents · … ». */
 .sagroup { margin: 8px 0; border: 1px solid var(--vscode-editorWidget-border, rgba(128,128,128,.3)); border-radius: 6px; }
 .sagroup > summary { display: flex; align-items: center; gap: 5px; padding: 4px 8px; font-size: 11px; color: var(--vscode-descriptionForeground); list-style: none; }
@@ -757,15 +768,18 @@ const CHAT_HTML_VIEW = `
 <h2>Nouvelle conversation</h2>
 <p>Sélectionnez un thread dans la liste ci-dessus, ou démarrez un nouveau thread principal pour discuter avec un agent de code (Claude, Codex, OpenCode, Agy) depuis la barre latérale secondaire.</p>
 <button id="wbtn" type="button">＋ Nouveau thread</button>
+<button id="wimport" type="button" title="Importer une session native d'un CLI comme thread">Importer une session…</button>
 </div>
 <div id="thead">
 <select id="tsel" aria-label="Thread affiché" title="Thread affiché"></select>
 <span id="tstatus" class="st-idle"></span>
 <div id="tacts">
 <button id="btnNew" type="button" title="Nouveau thread (agent principal)">＋</button>
+<button id="btnImport" type="button" title="Importer une session native">⤓</button>
 <button id="btnDelegate" type="button" title="Déléguer à un sous-agent" style="display:none">⑂</button>
 <button id="btnAgent" type="button" title="Changer d'agent, de modèle ou d'effort" disabled>⇄</button>
 <button id="btnStop" type="button" title="Interrompre l'exécution en cours" style="display:none">⏹</button>
+<button id="btnDelThread" type="button" title="Supprimer ce thread" style="display:none">🗑</button>
 </div>
 </div>
 <div id="subline"></div>

@@ -1,0 +1,60 @@
+{
+  "info": {
+    "id": "ses_new",
+    "title": "Nouvelle session",
+    "model": { "id": "mock-model", "providerID": "acme", "variant": "default" },
+    "time": { "created": 1792775400000, "updated": 1792775500000 },
+    "location": { "directory": "C:\\Users\\test\\ws" }
+  },
+  "messages": [
+    {
+      "id": "msg_1",
+      "time": { "created": 1792775401000 },
+      "type": "user",
+      "text": "Crée a.txt"
+    },
+    {
+      "id": "msg_2",
+      "time": { "created": 1792775402000 },
+      "type": "assistant",
+      "model": { "id": "mock-model", "providerID": "acme", "variant": "high" },
+      "content": [
+        { "type": "reasoning", "text": "Réflexion interne à ignorer" },
+        {
+          "type": "tool",
+          "id": "call_write",
+          "name": "write",
+          "state": {
+            "status": "completed",
+            "input": { "path": "a.txt", "content": "ok" },
+            "content": [{ "type": "text", "text": "Created file a.txt" }]
+          }
+        },
+        {
+          "type": "tool",
+          "id": "call_read",
+          "name": "read",
+          "state": {
+            "status": "error",
+            "input": { "path": "missing.txt" },
+            "content": [{ "type": "text", "text": "Fichier absent" }],
+            "error": "Fichier absent"
+          }
+        }
+      ]
+    },
+    {
+      "id": "msg_3",
+      "time": { "created": 1792775403000 },
+      "type": "assistant",
+      "model": { "id": "mock-model", "providerID": "acme", "variant": "high" },
+      "content": [{ "type": "text", "text": "a.txt créé." }]
+    },
+    {
+      "id": "msg_4",
+      "time": { "created": 1792775404000 },
+      "type": "idle",
+      "outcome": "succeeded"
+    }
+  ]
+}

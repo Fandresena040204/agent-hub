@@ -18,6 +18,8 @@ export class ThreadsTreeProvider implements vscode.TreeDataProvider<ThreadInfo> 
   constructor(private readonly orch: OrchestratorApi) {
     // Toute mise à jour de thread redessine l'arbre (accès occasionnel : la liste est petite).
     this.subs.push(new vscode.Disposable(this.orch.onDidChangeThread(() => this.emitter.fire(undefined))));
+    // Thread supprimé : purge du cache puis redessin.
+    this.subs.push(new vscode.Disposable(this.orch.onDidRemoveThread((id) => this.onThreadRemoved(id))));
   }
 
   getTreeItem(thread: ThreadInfo): vscode.TreeItem {
@@ -66,6 +68,23 @@ export class ThreadsTreeProvider implements vscode.TreeDataProvider<ThreadInfo> 
     }
     this.cache.set(thread.id, thread);
     return thread;
+  }
+
+  /** Thread supprimé : purge du thread et, par précaution, de tout descendant resté en cache. */
+  private onThreadRemoved(rootId: string): void {
+    const gone = new Set<string>([rootId]);
+    let grew = true;
+    while (grew) {
+      grew = false;
+      for (const [id, t] of this.cache) {
+        if (!gone.has(id) && t.parentId && gone.has(t.parentId)) {
+          gone.add(id);
+          grew = true;
+        }
+      }
+    }
+    for (const id of gone) this.cache.delete(id);
+    this.emitter.fire(undefined);
   }
 
   private prune(kept: ThreadInfo[]): void {

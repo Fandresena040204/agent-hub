@@ -16,9 +16,15 @@ export class ChangesView implements vscode.TreeDataProvider<ChangedFile> {
   private threadId: string | undefined;
   private title = '';
   private unsub: Unsubscribe | undefined;
+  private unsubRemoved: Unsubscribe | undefined;
   private timer: ReturnType<typeof setTimeout> | undefined;
 
-  constructor(private readonly orch: OrchestratorApi) {}
+  constructor(private readonly orch: OrchestratorApi) {
+    // Thread suivi supprimé : la vue passe vide (désélection).
+    this.unsubRemoved = orch.onDidRemoveThread((threadId) => {
+      if (threadId === this.threadId) this.setThread(undefined);
+    });
+  }
 
   /** Sélectionne le thread suivi (désélection = undefined) ; déclenche un rafraîchissement. */
   setThread(threadId: string | undefined): void {
@@ -37,6 +43,7 @@ export class ChangesView implements vscode.TreeDataProvider<ChangedFile> {
   dispose(): void {
     if (this.timer) clearTimeout(this.timer);
     this.unsub?.();
+    this.unsubRemoved?.();
     this.emitter.dispose();
   }
 

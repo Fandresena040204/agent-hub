@@ -1,5 +1,5 @@
 // Contrat de l'Orchestrator, partagé par l'UI et le serveur MCP.
-import type { AgentCapabilities } from '../adapters/AgentAdapter';
+import type { AgentCapabilities, NativeSession } from '../adapters/AgentAdapter';
 import type { StoredEvent } from './events';
 import type { AgentId, CommitPermission, IsolationMode, PermissionMode, ThreadInfo } from './types';
 
@@ -88,6 +88,23 @@ export interface OrchestratorApi {
   getEvents(threadId: string, lastN?: number): StoredEvent[];
 
   startMainThread(req: MainThreadRequest): Promise<ThreadInfo>;
+
+  /**
+   * Sessions natives importables d'un agent pour ce workspace. `importedThreadId` est renseigné si la session
+   * est déjà suivie par un thread Agent Hub (créé par Agent Hub ou déjà importé). Agent sans `listSessions` → erreur explicite.
+   */
+  listImportableSessions(agent: AgentId): Promise<(NativeSession & { importedThreadId?: string })[]>;
+  /**
+   * Importe une session native comme thread principal inactif (statut idle) : historique converti, sessionId conservé
+   * pour reprendre la session native au prochain message. Session déjà suivie → renvoie le thread existant.
+   */
+  importSession(agent: AgentId, sessionId: string): Promise<ThreadInfo>;
+  /**
+   * Supprime un thread d'Agent Hub et, pour un thread principal, tous ses threads délégués (interrompus s'ils tournent,
+   * worktrees supprimés, verrous de scope libérés, jeton MCP révoqué). La session native du CLI n'est PAS supprimée.
+   */
+  deleteThread(threadId: string): Promise<void>;
+  onDidRemoveThread(cb: (threadId: string) => void): Unsubscribe;
   /** Lève une Error au message explicite (modèle/effort invalide, scope en conflit, limite de threads…). */
   delegate(parentId: string, req: DelegateRequest): Promise<ThreadInfo>;
   /**

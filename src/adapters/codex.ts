@@ -4,9 +4,10 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import type { AgentCapabilities, AgentAdapter, AgentRun, StartOptions } from './AgentAdapter';
+import type { AgentCapabilities, AgentAdapter, AgentRun, StartOptions, NativeSession, NativeSessionContent } from './AgentAdapter';
 import type { AgentId } from '../core/types';
 import { runCli } from './process';
+import { listCodexSessions, readCodexSession } from './sessions/codexSessions';
 import {
   CliAgentRun,
   TurnContext,
@@ -333,5 +334,15 @@ export class CodexAdapter implements AgentAdapter {
     const env: NodeJS.ProcessEnv = {};
     if (opts.mcpServerUrl && opts.mcpToken) env.AGENT_HUB_MCP_TOKEN = opts.mcpToken;
     return new CodexRun(this.cfg, opts, env, () => this.getCapabilities());
+  }
+
+  /** Sessions natives du dossier (`$CODEX_HOME/sessions`, format documenté non vérifié). */
+  listSessions(cwd: string): Promise<NativeSession[]> {
+    return listCodexSessions(cwd);
+  }
+
+  /** Contenu d'une session native converti en événements communs. */
+  readSession(sessionId: string, cwd: string): Promise<NativeSessionContent> {
+    return readCodexSession(sessionId, cwd);
   }
 }

@@ -45,7 +45,7 @@ export interface AgentSegment {
   /** Horodatage du début de ce segment. */
   since: number;
   /** Comment ce segment a commencé. */
-  mode: 'start' | 'resume' | 'handoff';
+  mode: 'start' | 'resume' | 'handoff' | 'import';
 }
 
 export interface ThreadInfo {

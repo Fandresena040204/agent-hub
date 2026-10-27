@@ -6,7 +6,8 @@
 //   - enregistre ses argv JSON dans MOCK_ARGS_FILE (une ligne par appel)
 //   - enregistre les variables d'env OPENCODE_*/AGENT_HUB_* dans MOCK_ENV_FILE
 //   - --version → « mock 1.0.0 », --help → MOCK_HELP_FILE, « models » → MOCK_MODELS_FILE,
-//     « api » → MOCK_API_FILE
+//     « api » → MOCK_API_FILE, « session list » → MOCK_SESSION_LIST_FILE,
+//     « session export » → MOCK_SESSION_EXPORT_FILE
 //   - sinon rejoue la fixture ligne par ligne sur stdout (MOCK_DELAY_MS, défaut 1)
 //   - code de sortie : MOCK_EXIT_CODE (défaut 0)
 
@@ -67,6 +68,16 @@ if (args[0] === 'models') {
 if (args[0] === 'api') {
   if (!process.env.MOCK_API_FILE) finish('mock: pas de MOCK_API_FILE', 1);
   finish(readFile(process.env.MOCK_API_FILE, '{}'), 0);
+}
+
+if (args[0] === 'session' && args[1] === 'list') {
+  if (!process.env.MOCK_SESSION_LIST_FILE) finish('mock: pas de MOCK_SESSION_LIST_FILE', 1);
+  finish(readFile(process.env.MOCK_SESSION_LIST_FILE, '[]'), 0);
+}
+
+if (args[0] === 'session' && args[1] === 'export') {
+  if (!process.env.MOCK_SESSION_EXPORT_FILE) finish('mock: pas de MOCK_SESSION_EXPORT_FILE', 1);
+  finish(readFile(process.env.MOCK_SESSION_EXPORT_FILE, '{}'), 0);
 }
 
 if (!fixture) finish('mock: fixture manquante', 1);

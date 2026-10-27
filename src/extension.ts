@@ -18,6 +18,8 @@ import { ChangesView, registerBaseContentProvider } from './ui/ChangesView';
 import { CommitStatusBar } from './ui/CommitStatusBar';
 import { confirmCommit } from './ui/commitDialog';
 import { runChangeAgentWizard, runDelegateWizard, runNewThreadWizard } from './ui/newThreadWizard';
+import { runImportSessionWizard } from './ui/sessionImport';
+import { confirmAndDeleteThread } from './ui/threadDelete';
 
 let output: vscode.OutputChannel | undefined;
 let orchestrator: Orchestrator | undefined;
@@ -175,6 +177,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<AgentH
           { location: vscode.ProgressLocation.Notification, title: `Agent Hub : changement d'agent (${req.agent})…` },
           () => orch.changeAgent(thread.id, req),
         );
+      }),
+    ),
+    vscode.commands.registerCommand('agentHub.importSession', () =>
+      run(async () => {
+        const thread = await runImportSessionWizard(orch);
+        if (!thread) return;
+        chatView.showThread(thread.id);
+        changes.setThread(thread.id);
+      }),
+    ),
+    vscode.commands.registerCommand('agentHub.deleteThread', (arg: unknown) =>
+      run(async () => {
+        const id = threadIdOf(arg);
+        if (id) await confirmAndDeleteThread(orch, id);
       }),
     ),
     vscode.commands.registerCommand('agentHub.newMainThread', () =>

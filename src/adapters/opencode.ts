@@ -1,9 +1,10 @@
 // Adaptateur OpenCode v2 : `opencode run --format json --standalone`.
 
-import type { AgentCapabilities, AgentAdapter, AgentRun, StartOptions } from './AgentAdapter';
+import type { AgentCapabilities, AgentAdapter, AgentRun, StartOptions, NativeSession, NativeSessionContent } from './AgentAdapter';
 import type { AgentId } from '../core/types';
 import { runCli } from './process';
 import { normalizeRel } from '../core/glob';
+import { listOpenCodeSessions, readOpenCodeSession } from './sessions/opencodeSessions';
 import {
   CliAgentRun,
   TurnContext,
@@ -275,5 +276,15 @@ export class OpenCodeAdapter implements AgentAdapter {
 
   start(opts: StartOptions): AgentRun {
     return new OpenCodeRun(this.cfg, opts, () => this.getCapabilities());
+  }
+
+  /** Sessions natives du dossier (`opencode session list`, filtrées sur le workspace). */
+  listSessions(cwd: string): Promise<NativeSession[]> {
+    return listOpenCodeSessions(cwd, { command: this.cfg.command, prefixArgs: this.cfg.prefixArgs });
+  }
+
+  /** Export d'une session native converti en événements communs. */
+  readSession(sessionId: string, cwd: string): Promise<NativeSessionContent> {
+    return readOpenCodeSession(sessionId, cwd, { command: this.cfg.command, prefixArgs: this.cfg.prefixArgs });
   }
 }

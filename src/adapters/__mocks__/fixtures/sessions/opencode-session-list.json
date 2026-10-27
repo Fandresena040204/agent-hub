@@ -1,0 +1,26 @@
+[
+  {
+    "id": "ses_new",
+    "title": "Nouvelle session",
+    "updated": 1792775500000,
+    "created": 1792775400000,
+    "projectId": "global",
+    "directory": "C:\\Users\\test\\ws"
+  },
+  {
+    "id": "ses_old",
+    "title": "Ancienne session",
+    "updated": 1792775300000,
+    "created": 1792775200000,
+    "projectId": "global",
+    "directory": "C:\\Users\\test\\ws"
+  },
+  {
+    "id": "ses_other",
+    "title": "Autre dossier",
+    "updated": 1792775600000,
+    "created": 1792775600000,
+    "projectId": "global",
+    "directory": "C:\\Users\\test\\other"
+  }
+]

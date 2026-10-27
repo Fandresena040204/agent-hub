@@ -6,6 +6,7 @@ import {
   isThreadRunning, sortThreads, truncate,
 } from './presentation';
 import type { FileStatus } from './presentation';
+import { subagentRemovedCardHtml } from './threadLifecycle';
 
 // ---------------------------------------------------------------- sélecteur de thread
 
@@ -174,6 +175,23 @@ export interface SubagentCardDatum {
   totals?: FilesTotals;
 }
 
+/**
+ * Membre d'un bloc de cartes : vivant (`thread`), ou grisée « Sous-agent supprimé »
+ * (`thread` absent + `removedId` renseigné = thread supprimé).
+ */
+export interface SubagentCardMember {
+  thread?: ThreadInfo;
+  removedId?: string;
+  blockId: string;
+  totals?: FilesTotals;
+}
+
+/** Rendu d'un membre de bloc : carte vivante, ou version grisée si le thread a été supprimé. */
+export function subagentCardMemberHtml(m: SubagentCardMember, groupId: string): string {
+  if (m.thread) return subagentCardHtml(m.thread, m.blockId, groupId, m.totals);
+  return subagentRemovedCardHtml(m.removedId ?? '', m.blockId);
+}
+
 /** Ligne 3 de la carte : activité en direct si le thread tourne, sinon résumé (ou message d'erreur). */
 export function subagentProgressText(t: ThreadInfo): string {
   if (isThreadRunning(t.status)) return t.lastActivity ?? '';
@@ -229,21 +247,39 @@ export function subagentCardHtml(
   );
 }
 
+/** En-tête d'un groupe incluant d'éventuels sous-agents supprimés : `N sous-agents · … · R supprimé(s)`. */
+export function subagentGroupHeaderText(threads: ThreadInfo[], removedCount: number): string {
+  const header = groupHeaderText(threads);
+  if (!removedCount) return header;
+  const n = threads.length + removedCount;
+  return [
+    `${n} sous-agent${n > 1 ? 's' : ''}`,
+    ...header.split(' · ').slice(1),
+    `${removedCount} supprimé${removedCount > 1 ? 's' : ''}`,
+  ].join(' · ');
+}
+
 /** HTML du groupe repliable : en-tête « N sous-agents · … » (mis à jour en direct) + cartes. */
-export function subagentGroupHtml(members: SubagentCardDatum[], groupId: string): string {
-  const header = groupHeaderText(members.map((m) => m.thread));
+export function subagentGroupHtml(members: SubagentCardMember[], groupId: string): string {
+  const live: ThreadInfo[] = [];
+  let removedCount = 0;
+  for (const m of members) {
+    if (m.thread) live.push(m.thread);
+    else if (m.removedId) removedCount++;
+  }
+  const header = subagentGroupHeaderText(live, removedCount);
   return (
     `<details class="sagroup" id="${escapeHtml(groupId)}" open>`
     + `<summary class="sagroup-h"><span class="sarrow">▸</span><span class="sgtext">${escapeHtml(header)}</span></summary>`
-    + `<div class="sacards">${members.map((m) => subagentCardHtml(m.thread, m.blockId, groupId, m.totals)).join('')}</div>`
+    + `<div class="sacards">${members.map((m) => subagentCardMemberHtml(m, groupId)).join('')}</div>`
     + '</details>'
   );
 }
 
 /** Carte seule (délégation unique) ou groupe complet (≥ 2 délégations consécutives). */
-export function cardsBlockHtml(members: SubagentCardDatum[], groupId: string): { single: boolean; html: string } {
+export function cardsBlockHtml(members: SubagentCardMember[], groupId: string): { single: boolean; html: string } {
   const m = members[0];
-  if (members.length <= 1) return { single: true, html: m ? subagentCardHtml(m.thread, m.blockId, groupId, m.totals) : '' };
+  if (members.length <= 1) return { single: true, html: m ? subagentCardMemberHtml(m, groupId) : '' };
   return { single: false, html: subagentGroupHtml(members, groupId) };
 }
 

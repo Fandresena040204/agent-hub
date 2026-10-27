@@ -5,6 +5,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import type { AgentHubApi } from '../src/extension';
 import type { ThreadInfo } from '../src/core/types';
+import { runCli } from '../src/adapters/process';
 
 const SUB_MODEL = 'opencode/deepseek-v4.1-flash-free';
 const results: { name: string; ok: boolean; detail?: string }[] = [];
@@ -257,6 +258,46 @@ export async function run(): Promise<void> {
     }
     assert(/off/.test(msg), `refus attendu, obtenu : ${msg || 'aucune erreur'}`);
     assert(git(ws, 'rev-parse', 'HEAD') === head, 'HEAD a changé');
+  });
+
+  for (const [agent, args] of [
+    ['claude', ['-p', 'Retiens le mot ANANAS. Réponds uniquement OK.', '--model', 'haiku', '--tools', '']],
+    ['opencode', ['run', '--standalone', '-m', SUB_MODEL, 'Retiens le mot ANANAS. Réponds uniquement OK.']],
+  ] as const) {
+    await step(`importer une session ${agent} créée hors d'Agent Hub et la poursuivre`, async () => {
+      // Session native créée directement avec le CLI, dans le dossier du workspace.
+      const created = await runCli(agent, [...args], ws, 240_000);
+      assert(created.code === 0, `${agent} : création de session impossible (${created.stderr.slice(-300)})`);
+      const sessions = await orch.listImportableSessions(agent);
+      // Titre parfois généré après coup (OpenCode : « Session sans titre ») : la plus récente non suivie ; le contenu est vérifié ensuite.
+      const fresh = sessions.find((s) => !s.importedThreadId);
+      assert(fresh, `session ${agent} non listée : ${sessions.map((s) => `${s.title}${s.importedThreadId ? ' (suivie)' : ''}`).join(' | ')}`);
+      const t = await orch.importSession(agent, fresh.id);
+      assert(t.status === 'idle' && t.sessionId === fresh.id && !t.parentId, `thread importé inattendu : ${t.status} ${t.sessionId}`);
+      assert(orch.getEvents(t.id).some((e) => e.event.type === 'user_text' && /ANANAS/.test(e.event.text)), 'historique non importé');
+      assert((await orch.importSession(agent, fresh.id)).id === t.id, 'second import : un nouveau thread a été créé');
+      await vscode.commands.executeCommand('agentHub.openThread', t.id);
+      await orch.sendMessage(t.id, 'Quel mot devais-tu retenir ? Réponds par ce seul mot, sans outil.');
+      const done = await orch.waitThread(t.id, 300);
+      assert(done.status === 'idle', `statut : ${done.status} ${done.error ?? ''}`);
+      const last = [...orch.getEvents(t.id)].reverse().find((e) => e.event.type === 'assistant_text')?.event;
+      assert(last?.type === 'assistant_text' && /ananas/i.test(last.text), `contexte perdu : ${last?.type === 'assistant_text' ? last.text.slice(0, 120) : '—'}`);
+      await sleep(1200);
+      await screenshot(`8-session-${agent}-importee`);
+    });
+  }
+
+  await step('supprimer le thread principal et ses délégués', async () => {
+    assert(main, 'pas de thread principal');
+    const ids = [main.id, ...orch.listThreads().filter((t) => t.parentId === main!.id).map((t) => t.id)];
+    const removed: string[] = [];
+    const unsub = orch.onDidRemoveThread((id) => removed.push(id));
+    await orch.deleteThread(main.id);
+    unsub();
+    for (const id of ids) assert(!orch.getThread(id), `thread ${id} encore présent`);
+    assert(ids.every((id) => removed.includes(id)), `notifications de suppression manquantes : ${removed.join(',')}`);
+    await sleep(1200);
+    await screenshot('9-apres-suppression');
   });
 
   console.log(`HEAD initial ${head0.slice(0, 7)} → final ${git(ws, 'rev-parse', 'HEAD').slice(0, 7)}`);

@@ -44,6 +44,27 @@ export interface AgentRun {
   interrupt(): Promise<void>;
 }
 
+/** Session native d'un CLI (hors Agent Hub), importable. */
+export interface NativeSession {
+  id: string;
+  title: string;
+  /** Horodatages en ms. */
+  createdAt?: number;
+  updatedAt: number;
+  cwd?: string;
+  model?: string;
+  messageCount?: number;
+}
+
+export interface NativeSessionContent {
+  /** Historique converti dans le schéma commun (user_text, assistant_text, tool_call, tool_result, file_changed…). */
+  events: { ts: number; event: AgentEvent }[];
+  title?: string;
+  model?: string;
+  effort?: string;
+  cwd?: string;
+}
+
 export interface AgentAdapter {
   id: AgentId;
   label: string;
@@ -52,6 +73,10 @@ export interface AgentAdapter {
   /** Validation propre au CLI (sinon validateOptions sur les capabilities) ; lève InvalidOptionError. */
   validate?(model?: string, effort?: string): Promise<void>;
   start(opts: StartOptions): AgentRun;
+  /** Sessions natives du CLI pour ce dossier, les plus récentes d'abord (absent = import non supporté). */
+  listSessions?(cwd: string): Promise<NativeSession[]>;
+  /** Contenu d'une session native, converti en événements communs. */
+  readSession?(sessionId: string, cwd: string): Promise<NativeSessionContent>;
 }
 
 /** Erreur levée quand un modèle ou un effort n'est pas valide ; le message liste les valeurs valides. */

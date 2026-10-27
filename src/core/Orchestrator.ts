@@ -5,7 +5,13 @@ import { randomUUID } from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import type { AgentAdapter, AgentRun, StartOptions } from '../adapters/AgentAdapter';
+import type {
+  AgentAdapter,
+  AgentRun,
+  NativeSession,
+  NativeSessionContent,
+  StartOptions,
+} from '../adapters/AgentAdapter';
 import { validateOptions } from '../adapters/AgentAdapter';
 import type { AgentEvent, AgentRef, StoredEvent } from './events';
 import { buildHandoff } from './handoff';
@@ -137,6 +143,14 @@ function toolActivity(name: string): string {
   return `outil ${name.replace(/^mcp__agenthub__/, '')}`;
 }
 
+/** Première consigne utilisateur d'un historique importé, pour le titre du thread. */
+function firstUserText(events: { event: AgentEvent }[]): string | undefined {
+  for (const stored of events) {
+    if (stored.event.type === 'user_text' && stored.event.text.trim()) return titleOf(stored.event.text);
+  }
+  return undefined;
+}
+
 function readIfExists(abs: string): string | undefined {
   try {
     return fs.readFileSync(abs, 'utf8');
@@ -206,6 +220,7 @@ export class Orchestrator implements OrchestratorApi {
   private commitPermission: CommitPermission;
   private readonly threadListeners: ((t: ThreadInfo) => void)[] = [];
   private readonly eventListeners: ((id: string, e: StoredEvent) => void)[] = [];
+  private readonly removeListeners: ((id: string) => void)[] = [];
   private readonly permListeners: ((p: CommitPermission) => void)[] = [];
   private fsTimer?: ReturnType<typeof setTimeout>;
   private readonly pendingFs = new Set<string>();
@@ -280,6 +295,14 @@ export class Orchestrator implements OrchestratorApi {
     };
   }
 
+  onDidRemoveThread(cb: (threadId: string) => void): Unsubscribe {
+    this.removeListeners.push(cb);
+    return () => {
+      const i = this.removeListeners.indexOf(cb);
+      if (i >= 0) this.removeListeners.splice(i, 1);
+    };
+  }
+
   // ── Lecture ──────────────────────────────────────────────────────────
 
   listThreads(): ThreadInfo[] {
@@ -314,6 +337,174 @@ export class Orchestrator implements OrchestratorApi {
         }
       }),
     );
+  }
+
+  // ── Import de sessions natives et suppression ───────────────────────
+
+  async listImportableSessions(agent: AgentId): Promise<(NativeSession & { importedThreadId?: string })[]> {
+    const adapter = this.adapters[agent];
+    if (!adapter) throw new Error(`Agent ${agent} non configuré.`);
+    if (!adapter.listSessions) {
+      throw new Error(`L'import de sessions n'est pas encore pris en charge pour ${adapter.label}.`);
+    }
+    const avail = await adapter.isAvailable();
+    if (!avail.ok) {
+      throw new Error(`Agent ${agent} indisponible${avail.detail ? ` : ${avail.detail}` : '.'}`);
+    }
+    let sessions: NativeSession[];
+    try {
+      sessions = await adapter.listSessions(this.workspaceRoot);
+    } catch (err) {
+      throw new Error(`Sessions ${adapter.label} indisponibles : ${messageOf(err)}`);
+    }
+    return sessions.map((session) => {
+      const known = this.threadForSession(agent, session.id);
+      return known ? { ...session, importedThreadId: known.id } : { ...session };
+    });
+  }
+
+  async importSession(agent: AgentId, sessionId: string): Promise<ThreadInfo> {
+    const adapter = this.adapters[agent];
+    if (!adapter) throw new Error(`Agent ${agent} non configuré.`);
+    if (!adapter.readSession) {
+      throw new Error(`L'import de sessions n'est pas encore pris en charge pour ${adapter.label}.`);
+    }
+    // Session déjà suivie : on ne duplique jamais un thread.
+    const known = this.threadForSession(agent, sessionId);
+    if (known) return known;
+
+    let content: NativeSessionContent;
+    try {
+      content = await adapter.readSession(sessionId, this.workspaceRoot);
+    } catch (err) {
+      throw new Error(`Lecture de la session ${sessionId} (${adapter.label}) impossible : ${messageOf(err)}`);
+    }
+
+    const firstTs = content.events.find((stored) => Number.isFinite(stored.ts))?.ts;
+    const createdAt = firstTs ?? Date.now();
+    // Titres par défaut des CLI (titre pas encore généré) : on préfère le premier message.
+    const nativeTitle = content.title?.trim();
+    const untitled = !nativeTitle || /^(session sans titre|new session|untitled|nouvelle session)/i.test(nativeTitle);
+    const title = (untitled ? undefined : nativeTitle) || firstUserText(content.events) || `Session ${sessionId}`;
+    const thread: ThreadInfo = {
+      id: this.newId(),
+      agent,
+      model: content.model,
+      effort: content.effort,
+      permissionMode: 'edit',
+      isolation: 'shared',
+      cwd: this.workspaceRoot,
+      sessionId,
+      title,
+      status: 'idle',
+      createdAt,
+      updatedAt: Date.now(),
+      changedFiles: [],
+      violations: { scope: [], commits: [] },
+      agentHistory: [{
+        agent,
+        model: content.model,
+        effort: content.effort,
+        sessionId,
+        since: createdAt,
+        mode: 'import',
+      }],
+    };
+    this.threads.set(thread.id, thread);
+
+    // Historique converti conservé tel quel, horodatages d'origine compris.
+    for (const stored of content.events) {
+      this.appendStored(thread.id, { ts: stored.ts, event: stored.event });
+    }
+    this.storeEvent(thread.id, {
+      type: 'assistant_text',
+      text: `[Agent Hub] Session ${adapter.label} importée (${sessionId}). Le prochain message reprend cette session.`,
+      partial: false,
+    });
+    this.touch(thread);
+    return thread;
+  }
+
+  async deleteThread(threadId: string): Promise<void> {
+    if (!this.threads.has(threadId)) throw new Error(`Thread introuvable : ${threadId}`);
+    // Enfants d'abord (récursivement), thread demandé en dernier.
+    const order: string[] = [];
+    const collect = (id: string): void => {
+      for (const child of [...this.threads.values()]) {
+        if (child.parentId === id) collect(child.id);
+      }
+      order.push(id);
+    };
+    collect(threadId);
+    for (const id of order) await this.deleteOneThread(id);
+  }
+
+  /** Supprime un thread : interruption, runtime, verrou de scope, worktree, jeton MCP, store, notification. */
+  private async deleteOneThread(threadId: string): Promise<void> {
+    const thread = this.threads.get(threadId);
+    if (!thread) return;
+
+    if (isActive(thread.status)) {
+      try {
+        await this.interrupt(threadId);
+      } catch (err) {
+        log.warn(`Interruption avant suppression ${threadId} : ${messageOf(err)}`);
+      }
+    }
+
+    const rt = this.runtimes.get(threadId);
+    if (rt) {
+      this.clearThreadTimeout(rt);
+      rt.watcher = undefined;
+      rt.watcherCwd = undefined;
+      rt.pendingHandoff = undefined;
+      rt.run = undefined;
+      rt.runToken += 1;
+    }
+    this.scopeRegistry.release(threadId);
+
+    if (this.worktrees && (thread.worktreePath || this.worktrees.exists(threadId))) {
+      try {
+        await this.worktrees.remove(threadId);
+      } catch (err) {
+        log.warn(`Suppression du worktree ${threadId} : ${messageOf(err)}`);
+      }
+    }
+
+    // Le jeton MCP n'a de sens que pour un thread principal.
+    if (this.mcp && (!thread.parentId || rt?.mcpToken)) {
+      try {
+        this.mcp.unregister(threadId);
+      } catch (err) {
+        log.warn(`Désenregistrement MCP ${threadId} : ${messageOf(err)}`);
+      }
+    }
+    if (rt) rt.mcpToken = undefined;
+
+    this.runtimes.delete(threadId);
+    this.threads.delete(threadId);
+    try {
+      this.store.deleteThread(threadId);
+    } catch (err) {
+      log.warn(`Suppression des fichiers du thread ${threadId} : ${messageOf(err)}`);
+    }
+    for (const cb of this.removeListeners) {
+      try {
+        cb(threadId);
+      } catch (err) {
+        log.warn(`Callback suppression ${threadId} : ${messageOf(err)}`);
+      }
+    }
+  }
+
+  /** Thread Agent Hub suivant déjà cette session native (créée par Agent Hub ou importée). */
+  private threadForSession(agent: AgentId, sessionId: string): ThreadInfo | undefined {
+    for (const thread of this.threads.values()) {
+      if (thread.agent === agent && thread.sessionId === sessionId) return thread;
+      const segment = thread.agentHistory?.find((s) => s.agent === agent && s.sessionId === sessionId);
+      if (segment) return thread;
+    }
+    return undefined;
   }
 
   // ── Cycle de vie ────────────────────────────────────────────────────
@@ -1286,6 +1477,12 @@ export class Orchestrator implements OrchestratorApi {
 
   private storeEvent(threadId: string, event: AgentEvent): StoredEvent {
     const stored: StoredEvent = { ts: Date.now(), event };
+    this.appendStored(threadId, stored);
+    return stored;
+  }
+
+  /** Écrit un événement déjà horodaté (import d'historique) : store + notification. */
+  private appendStored(threadId: string, stored: StoredEvent): void {
     try {
       this.store.appendEvent(threadId, stored);
     } catch (err) {
@@ -1298,7 +1495,6 @@ export class Orchestrator implements OrchestratorApi {
         log.warn(`Callback event : ${messageOf(err)}`);
       }
     }
-    return stored;
   }
 
   private armTimeout(thread: ThreadInfo): void {
