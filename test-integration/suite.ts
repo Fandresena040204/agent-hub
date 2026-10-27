@@ -136,6 +136,22 @@ export async function run(): Promise<void> {
     await vscode.commands.executeCommand('agentHub.changes.focus');
     await sleep(800);
     await screenshot('3-thread-delegue-et-diff');
+
+    // Façon T3 Code : carte du sous-agent dans la conversation du parent, enfant en lecture seule.
+    assert(
+      orch.getEvents(main!.id).some((e) => e.event.type === 'subagent_started' && e.event.threadId === child.id),
+      'carte subagent_started absente du thread parent',
+    );
+    let refused = '';
+    try {
+      await orch.sendMessage(child.id, 'message direct');
+    } catch (err) {
+      refused = err instanceof Error ? err.message : String(err);
+    }
+    assert(/lecture seule/.test(refused), `un message utilisateur vers l'enfant aurait dû être refusé : ${refused || 'accepté'}`);
+    await vscode.commands.executeCommand('agentHub.openThread', main!.id);
+    await sleep(1500);
+    await screenshot('3b-carte-sous-agent-dans-le-parent');
   });
 
   await step('worktree : isolation, application non commitée, suppression', async () => {

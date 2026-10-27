@@ -29,9 +29,10 @@ Un CLI absent n'empêche rien : il apparaît comme indisponible, avec un message
 1. Barre d'activité → **Agent Hub** → bouton **+** (ou commande **« Agent Hub: Nouveau thread principal »**).
 2. Choisir l'agent, le modèle, le niveau d'effort (proposé seulement si le CLI en a) et le mode de permission (`readonly` / `edit` / `full`), puis saisir la consigne. Les listes sont lues dynamiquement depuis chaque CLI.
 3. La conversation s'affiche dans la **barre latérale secondaire**, au même endroit que le Chat de VS Code (onglet « Agent Hub ») : sélecteur de thread, appels d'outils repliables, bandeaux de relais d'agent. Au-dessus de la saisie, le bloc **« N fichiers modifiés +A −D »** liste les fichiers du thread : clic = diff, **Conserver** / **Annuler** par fichier ou pour tous, **Appliquer** pour un thread worktree. Entrée envoie un message de suivi (la session du CLI est reprise).
-4. Quand l'agent principal délègue, les threads enfants apparaissent sous lui dans la vue **Threads**, avec agent, modèle, effort, isolation, statut et nombre de fichiers modifiés. Un clic ouvre leur conversation ; le panneau du thread principal reste ouvert.
-5. La vue **Fichiers modifiés** liste les fichiers du thread sélectionné ; un clic ouvre le diff par rapport à l'état de base propre à ce thread.
-6. Threads `worktree` terminés (menu contextuel) : **Voir le diff**, **Appliquer** (applique au workspace, sans commit), **Supprimer le worktree**.
+4. **Sous-agents façon T3 Code** : chaque délégation apparaît **dans la conversation du parent sous forme de carte vivante** (agent, modèle, effort, statut, dernière activité, durée, résumé, `N fichiers +A −D`, boutons Ouvrir / Stop / Appliquer) ; plusieurs délégations consécutives se regroupent dans une carte repliable. Une notification signale la fin d'un sous-agent. Les **threads délégués sont en lecture seule** (réglage `agentHub.delegation.readOnlyChildren`, vrai par défaut) : on écrit au thread principal, qui pilote ses sous-agents ; un fil d'Ariane « ← parent › enfant » permet de remonter.
+5. Les threads enfants apparaissent aussi sous leur parent dans la vue **Threads**, avec agent, modèle, effort, isolation, statut et nombre de fichiers modifiés. Un clic ouvre leur conversation dans la vue de chat.
+6. La vue **Fichiers modifiés** liste les fichiers du thread sélectionné ; un clic ouvre le diff par rapport à l'état de base propre à ce thread.
+7. Threads `worktree` terminés (menu contextuel) : **Voir le diff**, **Appliquer** (applique au workspace, sans commit), **Supprimer le worktree**.
 
 ### Outils MCP exposés à l'agent principal
 
@@ -68,6 +69,8 @@ Hors dépôt git, l'isolation `shared` est forcée et l'outil `commit` est désa
 | `agentHub.<agent>.path` | nom du CLI | chemin du CLI (`claude`, `codex`, `opencode`, `agy`) |
 | `agentHub.<agent>.defaultModel` / `.defaultEffort` | — | valeurs présélectionnées |
 | `agentHub.delegation.allowedModels` | `[]` | modèles que l'agent principal peut choisir (vide = tous) |
+| `agentHub.delegation.allowedAgents` | `[]` | agents que l'agent principal peut choisir (vide = tous) |
+| `agentHub.delegation.readOnlyChildren` | `true` | threads délégués en lecture seule pour l'utilisateur |
 | `agentHub.delegation.maxActiveThreads` | `3` | threads délégués actifs en parallèle |
 | `agentHub.delegation.threadTimeoutSec` | `1800` | délai maximal par thread délégué |
 | `agentHub.isolation.policy` | `agent-decides` | ou `always-worktree` / `always-shared` |

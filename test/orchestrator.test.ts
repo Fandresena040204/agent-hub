@@ -146,6 +146,7 @@ describe('Orchestrator', () => {
       includeUncommitted: false,
       linkPaths: [],
       mainAgentCommit: 'deny',
+      readOnlyChildren: true,
       defaults: {},
     };
   });
@@ -276,8 +277,157 @@ describe('Orchestrator', () => {
         scope: ['src/a.ts'],
       }),
     ).rejects.toThrow(new RegExp(first.id));
+    // La délégation refusée ne laisse aucune carte orpheline dans le parent.
+    const cards = o.getEvents(main.id).filter((e) => e.event.type === 'subagent_started');
+    expect(cards.map((e) => (e.event as { threadId: string }).threadId)).toEqual([first.id]);
     gate.resolve();
     await o.waitThread(first.id, 10);
+  });
+
+  it('delegate : subagent_started émis dans le parent (store + notification), pas dans l’enfant', async () => {
+    const claude = mainAdapter();
+    const codex = new FakeAdapter('codex', 'Codex', { turns: [{ steps: [] }] });
+    const o = build({ claude, codex });
+    await o.init();
+
+    const main = await o.startMainThread({ agent: 'claude', prompt: 'main', permissionMode: 'edit' });
+    await o.waitThread(main.id, 10);
+
+    const notified: [string, string][] = [];
+    o.onDidAppendEvent((threadId, stored) => {
+      if (stored.event.type === 'subagent_started') notified.push([threadId, stored.event.threadId]);
+    });
+
+    const sub = await o.delegate(main.id, { agent: 'codex', prompt: 'sub', mode: 'readonly' });
+    await o.waitThread(sub.id, 10);
+
+    const started = o
+      .getEvents(main.id)
+      .filter((e) => e.event.type === 'subagent_started')
+      .map((e) => (e.event.type === 'subagent_started' ? e.event.threadId : ''));
+    expect(started).toEqual([sub.id]);
+    expect(notified).toEqual([[main.id, sub.id]]);
+    expect(o.getEvents(sub.id).some((e) => e.event.type === 'subagent_started')).toBe(false);
+  });
+
+  it('sendMessage : thread délégué en lecture seule pour l’utilisateur, ouvert à l’agent principal', async () => {
+    const claude = mainAdapter();
+    const codex = new FakeAdapter('codex', 'Codex', { turns: [{ steps: [] }, { steps: [] }, { steps: [] }] });
+    const o = build({ claude, codex });
+    await o.init();
+
+    const main = await o.startMainThread({ agent: 'claude', prompt: 'Objectif parent', permissionMode: 'edit' });
+    await o.waitThread(main.id, 10);
+    const sub = await o.delegate(main.id, { agent: 'codex', prompt: 'sub', mode: 'readonly' });
+    await o.waitThread(sub.id, 10);
+
+    await expect(o.sendMessage(sub.id, 'coucou')).rejects.toThrow(
+      /lecture seule : écrivez au thread principal \(Objectif parent\), qui pilote ses sous-agents/,
+    );
+    expect(codex.received).toEqual(['sub']);
+
+    // L'agent principal (outil MCP message_thread) passe from: 'agent'.
+    await o.sendMessage(sub.id, 'suivi agent', { from: 'agent' });
+    await o.waitThread(sub.id, 10);
+    expect(codex.received).toEqual(['sub', 'suivi agent']);
+
+    // Réglage désactivé : l'utilisateur reprend la main sur les threads enfants.
+    cfg.readOnlyChildren = false;
+    await o.sendMessage(sub.id, 'coucou utilisateur');
+    await o.waitThread(sub.id, 10);
+    expect(codex.received.at(-1)).toBe('coucou utilisateur');
+  });
+
+  it('changeAgent : refusé sur un thread délégué en lecture seule, accepté si le réglage est off', async () => {
+    const claude = mainAdapter();
+    const codex = new FakeAdapter('codex', 'Codex', { turns: [{ steps: [] }] });
+    const o = build({ claude, codex });
+    await o.init();
+
+    const main = await o.startMainThread({ agent: 'claude', prompt: 'Objectif parent', permissionMode: 'edit' });
+    await o.waitThread(main.id, 10);
+    const sub = await o.delegate(main.id, { agent: 'codex', prompt: 'sub', mode: 'readonly' });
+    await o.waitThread(sub.id, 10);
+
+    await expect(
+      o.changeAgent(sub.id, { agent: 'claude', model: 'm2', effort: 'high' }),
+    ).rejects.toThrow(/lecture seule/);
+    expect(o.getThread(sub.id)!.agent).toBe('codex');
+
+    cfg.readOnlyChildren = false;
+    const switched = await o.changeAgent(sub.id, { agent: 'claude', model: 'm2', effort: 'high' });
+    expect(switched.agent).toBe('claude');
+  });
+
+  it('lastActivity : première ligne du texte, puis outil (préfixe mcp retiré), tronqué à 140', async () => {
+    const long = 'x'.repeat(200);
+    const claude = mainAdapter([
+      {
+        steps: [
+          {
+            kind: 'emit',
+            event: { type: 'assistant_text', text: '\n  Analyse en cours\nsuite ignorée', partial: false },
+          },
+        ],
+      },
+      {
+        steps: [
+          { kind: 'emit', event: { type: 'assistant_text', text: 'brouillon partiel', partial: true } },
+          { kind: 'emit', event: { type: 'tool_call', id: 't1', name: 'mcp__agenthub__read_thread', input: {} } },
+        ],
+      },
+      { steps: [{ kind: 'emit', event: { type: 'assistant_text', text: long, partial: false } }] },
+    ]);
+    const o = build({ claude });
+    await o.init();
+
+    const main = await o.startMainThread({ agent: 'claude', prompt: 'main', permissionMode: 'edit' });
+    await o.waitThread(main.id, 10);
+    expect(o.getThread(main.id)!.lastActivity).toBe('Analyse en cours');
+    // Sauvegardé avec le thread.
+    expect(store.loadThreads().find((t) => t.id === main.id)?.lastActivity).toBe('Analyse en cours');
+
+    await o.sendMessage(main.id, 'suite');
+    await o.waitThread(main.id, 10);
+    // Le texte partiel est ignoré : c'est l'appel d'outil qui reste.
+    expect(o.getThread(main.id)!.lastActivity).toBe('outil read_thread');
+
+    await o.sendMessage(main.id, 'encore');
+    await o.waitThread(main.id, 10);
+    const activity = o.getThread(main.id)!.lastActivity!;
+    expect(activity).toHaveLength(140);
+    expect(activity.endsWith('…')).toBe(true);
+  });
+
+  it('finishedAt : posé à la fin du tour, effacé au tour suivant, posé à l’interruption', async () => {
+    const claude = mainAdapter([{ steps: [] }, { steps: [] }]);
+    const o = build({ claude });
+    await o.init();
+
+    const main = await o.startMainThread({ agent: 'claude', prompt: 'main', permissionMode: 'edit' });
+    await o.waitThread(main.id, 10);
+    const first = o.getThread(main.id)!;
+    expect(typeof first.finishedAt).toBe('number');
+    expect(first.finishedAt!).toBeGreaterThanOrEqual(first.createdAt);
+
+    // Tour suivant : le gate retient la fin du tour.
+    const gate = deferred();
+    claude.gate = gate.promise;
+    await o.sendMessage(main.id, 'encore');
+    expect(o.getThread(main.id)!.status).toBe('running');
+    expect(o.getThread(main.id)!.finishedAt).toBeUndefined();
+    gate.resolve();
+    await o.waitThread(main.id, 10);
+    expect(typeof o.getThread(main.id)!.finishedAt).toBe('number');
+
+    // Interruption : le tour est bien terminé.
+    const gate2 = deferred();
+    claude.gate = gate2.promise;
+    await o.sendMessage(main.id, 'long');
+    await o.interrupt(main.id);
+    expect(o.getThread(main.id)!.status).toBe('interrupted');
+    expect(typeof o.getThread(main.id)!.finishedAt).toBe('number');
+    gate2.resolve();
   });
 
   it('shared : écriture hors scope → scope_violation', async () => {
@@ -753,6 +903,7 @@ describe('Orchestrator', () => {
   });
 
   it('changeAgent sur un thread délégué : garde scope, isolation et gitPolicy sub, sans MCP', async () => {
+    cfg.readOnlyChildren = false;
     const claude = mainAdapter();
     const codex = new FakeAdapter('codex', 'Codex', { turns: [{ steps: [] }] });
     const o = build({ claude, codex });

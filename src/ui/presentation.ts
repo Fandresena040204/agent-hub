@@ -133,11 +133,77 @@ export function threadTooltip(info: ThreadInfo): string {
   return lines.join('\n\n');
 }
 
+// ---------------------------------------------------------------- cartes de sous-agents
+
+/** Phase d'une carte de sous-agent : en cours / terminée / en erreur (pastille et résumé de groupe). */
+export function cardPhase(status: ThreadStatus): 'run' | 'done' | 'fail' {
+  if (isThreadRunning(status)) return 'run';
+  if (status === 'error' || status === 'conflict') return 'fail';
+  return 'done';
+}
+
+/** Durée d'un thread en ms : (fin du tour ?? dernière mise à jour) − création, bornée à 0. */
+export function cardDurationMs(info: ThreadInfo, now: number): number {
+  const end = isThreadRunning(info.status) ? now : (info.finishedAt ?? info.updatedAt);
+  return Math.max(0, end - info.createdAt);
+}
+
+/** Durée lisible `mm:ss` (minutes non bornées, jamais négative). */
+export function formatDuration(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+}
+
+/** En-tête d'un groupe de cartes : `3 sous-agents · 2 terminés · 1 en cours`. */
+export function groupHeaderText(threads: ThreadInfo[]): string {
+  let running = 0;
+  let failed = 0;
+  for (const t of threads) {
+    const p = cardPhase(t.status);
+    if (p === 'run') running++;
+    else if (p === 'fail') failed++;
+  }
+  const done = threads.length - running - failed;
+  const parts = [`${threads.length} sous-agent${threads.length > 1 ? 's' : ''}`];
+  if (done) parts.push(`${done} terminé${done > 1 ? 's' : ''}`);
+  if (running) parts.push(`${running} en cours`);
+  if (failed) parts.push(`${failed} en erreur`);
+  return parts.join(' · ');
+}
+
+/**
+ * Un groupe de sous-agents ne s'étend que sur des délégations consécutives :
+ * un message de l'utilisateur ou de l'agent ferme le groupe (les autres événements l'excitent).
+ */
+export function breaksSubagentGroup(ev: AgentEvent): boolean {
+  return ev.type === 'user_text' || ev.type === 'assistant_text';
+}
+
+/** Fil d'Ariane d'un thread délégué : `← parent › enfant` (clic sur ← sélectionne le parent) ; '' pour un principal. */
+export function lineageHtml(child: ThreadInfo, parent: ThreadInfo | undefined): string {
+  if (!child.parentId) return '';
+  const pTitle = parent ? truncate(parent.title, 48) : 'thread parent';
+  return (
+    `<button type="button" class="lcrumb" data-id="${escapeHtml(child.parentId)}" title="Revenir au thread parent">← ${escapeHtml(pTitle)}</button>`
+    + `<span class="lgsep">›</span><span class="lgcur">${escapeHtml(truncate(child.title, 48))}</span>`
+  );
+}
+
+/** Statuts de fin d'un tour de sous-agent qui déclenchent une notification. */
+export const SUBAGENT_END_STATUSES: readonly ThreadStatus[] = ['done', 'error', 'interrupted'];
+
+/** Texte de la notification de fin : `Sous-agent terminé : <titre> (<agent>/<modèle>, mm:ss)`. */
+export function subagentNotificationText(info: ThreadInfo, now = Date.now()): string {
+  const ref = agentRefText({ agent: info.agent, model: info.model, effort: info.effort });
+  return `Sous-agent terminé : ${truncate(info.title, 60)} (${ref}, ${formatDuration(cardDurationMs(info, now))})`;
+}
+
 // ---------------------------------------------------------------- agents successifs / relais
 
 /** Réf lisible « agent/modèle · effort » (champs absents omis). */
 export function agentRefText(ref: AgentRef): string {
-  let s = ref.model ? `${ref.agent}/${ref.model}` : ref.agent;
+  // Un id OpenCode commence souvent par le nom du fournisseur « opencode/… » : pas de doublon.
+  let s = !ref.model ? ref.agent : ref.model.startsWith(`${ref.agent}/`) ? ref.model : `${ref.agent}/${ref.model}`;
   if (ref.effort) s += ` · ${ref.effort}`;
   return s;
 }
@@ -346,6 +412,9 @@ export function renderEventHtml(ev: AgentEvent, id: string): string {
     case 'agent_switched':
       // Bandeau neutre centré, ex. « — relais : claude/opus → opencode/glm-5.3 (passation) — ».
       return `<div id="${aid}" class="banner switch">— ${escapeHtml(agentSwitchText(ev))} —</div>`;
+    case 'subagent_started':
+      // Rendu spécial : la vue (ChatView) construit la carte vivante à partir de l'état du thread enfant.
+      return '';
     default:
       return '';
   }
@@ -400,7 +469,11 @@ function stick() { if (pinned) out.scrollTop = out.scrollHeight; }
 function apply(patch) {
   if (!patch.html) return;
   const el = patch.target ? document.getElementById(patch.target) : null;
-  if (el) { el.outerHTML = patch.html; } else { out.insertAdjacentHTML('beforeend', patch.html); }
+  if (el) {
+    // Conserver l'état plié d'un groupe de sous-agents reconstruit.
+    if (el.classList.contains('sagroup') && !el.open) patch.html = patch.html.replace(/^(<details[^>]*)\sopen/, '$1');
+    el.outerHTML = patch.html;
+  } else { out.insertAdjacentHTML('beforeend', patch.html); }
   stick();
 }
 function showErr(html) { errbar.innerHTML = html; stick(); }
@@ -412,7 +485,7 @@ const CHAT_CSS_CORE = `
 html, body { height: 100%; margin: 0; }
 body { display: flex; flex-direction: column; background: var(--vscode-editor-background); color: var(--vscode-editor-foreground); font-family: var(--vscode-font-family, sans-serif); font-size: var(--vscode-font-size, 13px); }
 [hidden] { display: none !important; }
-#out { flex: 1 1 auto; overflow-y: auto; }
+#out { flex: 1 1 auto; overflow-y: auto; overflow-x: hidden; }
 #errbar:empty { display: none; }
 #errbar { margin: 6px 10px 0; }
 .row { margin: 8px 0; display: flex; }
@@ -426,7 +499,7 @@ summary { cursor: pointer; color: var(--vscode-descriptionForeground); user-sele
 pre { margin: 6px 0 0; font-family: var(--vscode-editor-font-family, monospace); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
 pre.bad { color: var(--vscode-errorForeground); }
 .fileline { margin: 4px 0; font-size: 12px; color: var(--vscode-descriptionForeground); }
-.fileline code { color: var(--vscode-textLink-foreground); }
+.fileline code { color: var(--vscode-textLink-foreground); overflow-wrap: anywhere; }
 .banner { margin: 8px 0; padding: 6px 10px; border-radius: 4px; font-size: 12px; }
 .banner.err { color: var(--vscode-errorForeground); border-left: 2px solid var(--vscode-errorForeground); background: var(--vscode-inputValidation-errorBackground, transparent); }
 .banner.ok { color: var(--vscode-testingIconPassed, var(--vscode-charts-green, inherit)); border-left: 2px solid var(--vscode-testingIconPassed, var(--vscode-charts-green, currentColor)); background: var(--vscode-inputValidation-infoBackground, transparent); }
@@ -451,13 +524,16 @@ const sel = document.getElementById('tsel');
 const sub = document.getElementById('subline');
 const stchip = document.getElementById('tstatus');
 const filesblk = document.getElementById('filesblk');
+const lignee = document.getElementById('lignee');
+const robar = document.getElementById('robar');
+const btnGoMain = document.getElementById('btnGoMain');
 const ta = document.getElementById('vta');
 const sendB = document.getElementById('vsend');
 const btnNew = document.getElementById('btnNew');
 const btnDel = document.getElementById('btnDelegate');
 const btnAg = document.getElementById('btnAgent');
 const btnStop = document.getElementById('btnStop');
-let running = false, hasThread = false, isMain = false;
+let running = false, hasThread = false, isMain = false, ro = false, mainId = '';
 function sync() {
   document.body.classList.toggle('empty', !hasThread);
   sendB.textContent = running ? '⏹ Arrêter' : 'Envoyer';
@@ -466,8 +542,24 @@ function sync() {
   btnStop.style.display = running ? '' : 'none';
   btnDel.style.display = hasThread && isMain ? '' : 'none';
   btnDel.disabled = running;
+  // Changer d'agent : threads principaux seulement ; lecture seule des enfants : bandeau à la place de la saisie.
+  btnAg.style.display = hasThread && isMain ? '' : 'none';
   btnAg.disabled = !hasThread || running;
+  const roChild = hasThread && !isMain && ro;
+  robar.hidden = !roChild;
+  document.getElementById('vinput').style.display = roChild ? 'none' : '';
 }
+// Durée mm:ss d'une carte en cours (minuteur local, chaque seconde, à partir de data-start).
+function mmss(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  return String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
+}
+setInterval(function () {
+  for (const c of out.querySelectorAll('.sacard[data-running]')) {
+    const dur = c.querySelector('.sa-dur');
+    if (dur) dur.textContent = mmss(Date.now() - Number(c.dataset.start || 0));
+  }
+}, 1000);
 function fit() {
   ta.style.height = 'auto';
   ta.style.height = Math.min(ta.scrollHeight, 200) + 'px';
@@ -478,6 +570,9 @@ window.addEventListener('message', (e) => {
   else if (m.type === 'events') { for (const p of m.patches) apply(p); }
   else if (m.type === 'header') {
     hasThread = !!m.hasThread; running = !!m.running; isMain = !!m.isMain;
+    ro = !!m.readOnly; mainId = m.parentId || '';
+    lignee.innerHTML = m.lineage || '';
+    lignee.hidden = !m.lineage;
     sel.textContent = '';
     if (!hasThread) {
       const ph = document.createElement('option');
@@ -500,6 +595,18 @@ window.addEventListener('message', (e) => {
     sync();
   }
   else if (m.type === 'files') { filesblk.innerHTML = m.html || ''; }
+  else if (m.type === 'card') {
+    // Carte de sous-agent : remplacement de l'element [data-thread=...] + en-tête de groupe en direct.
+    let el = null;
+    for (const c of out.querySelectorAll('.sacard')) { if (c.dataset.thread === m.threadId) { el = c; break; } }
+    if (el) el.outerHTML = m.html;
+    if (m.groupId && m.header) {
+      const gd = document.getElementById(m.groupId);
+      const txt = gd ? gd.querySelector('.sgtext') : null;
+      if (txt) txt.innerHTML = m.header;
+    }
+    stick();
+  }
   else if (m.type === 'error') { showErr(m.html); }
   else if (m.type === 'clear-error') { errbar.textContent = ''; }
 });
@@ -520,6 +627,17 @@ btnDel.addEventListener('click', () => vs.postMessage({ t: 'delegate' }));
 btnAg.addEventListener('click', () => vs.postMessage({ t: 'changeAgent' }));
 btnStop.addEventListener('click', () => vs.postMessage({ t: 'stop' }));
 document.getElementById('wbtn').addEventListener('click', () => vs.postMessage({ t: 'newThread' }));
+// Fil d'Ariane : clic sur « ← parent » pour revenir au thread principal.
+lignee.addEventListener('click', function (e) {
+  const b = e.target.closest('[data-id]');
+  if (b) { e.preventDefault(); vs.postMessage({ t: 'selectThread', id: b.dataset.id }); }
+});
+btnGoMain.addEventListener('click', function () { if (mainId) vs.postMessage({ t: 'selectThread', id: mainId }); });
+// Boutons du pied des cartes de sous-agents (Ouvrir / Stop / Appliquer).
+out.addEventListener('click', function (e) {
+  const b = e.target.closest('[data-cact]');
+  if (b) { e.preventDefault(); vs.postMessage({ t: b.dataset.cact, id: b.dataset.id }); }
+});
 filesblk.addEventListener('click', function (e) {
   const btn = e.target.closest('[data-act]');
   if (btn) {
@@ -593,6 +711,45 @@ body.empty #welcome { display: flex; }
 #welcome p { margin: 0; max-width: 34em; }
 #wbtn { background: var(--vscode-button-background); color: var(--vscode-button-foreground); padding: 5px 14px; }
 #wbtn:hover { background: var(--vscode-button-hoverBackground); }
+/* Fil d'Ariane des threads délégués : ← parent › enfant. */
+#lignee { display: flex; align-items: center; gap: 4px; padding: 3px 10px 0; font-size: 11px; color: var(--vscode-descriptionForeground); white-space: nowrap; overflow: hidden; }
+#lignee .lcrumb { background: transparent; color: var(--vscode-textLink-foreground); font-size: 11px; padding: 0 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 55%; }
+#lignee .lcrumb:hover { text-decoration: underline; }
+#lignee .lgsep { flex: none; }
+#lignee .lgcur { overflow: hidden; text-overflow: ellipsis; }
+/* Bandeau de lecture seule des threads délégués (à la place de la zone de saisie). */
+#robar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; margin: 6px 8px 8px; padding: 8px 10px; border: 1px solid var(--vscode-editorWidget-border, rgba(128,128,128,.35)); border-radius: 6px; font-size: 12px; color: var(--vscode-descriptionForeground); background: var(--vscode-input-background); }
+#robar span { flex: 1 1 180px; min-width: 0; }
+#robar button { flex: none; background: var(--vscode-button-secondaryBackground, transparent); color: var(--vscode-button-secondaryForeground, var(--vscode-foreground, inherit)); padding: 3px 10px; white-space: nowrap; }
+#robar button:hover { background: var(--vscode-button-hoverBackground); }
+/* Cartes de sous-agents dans la conversation du parent. */
+.sacard { margin: 4px 0; padding: 6px 9px; border: 1px solid var(--vscode-editorWidget-border, rgba(128,128,128,.3)); border-radius: 6px; background: var(--vscode-notifications-background, transparent); }
+.sacard .sa-l1 { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.sacard .sdot { width: 9px; height: 9px; border-radius: 50%; background: var(--vscode-descriptionForeground); flex: none; }
+.sacard.sa-run .sdot { background: var(--vscode-charts-yellow, #db0); animation: sacard-pulse 1.2s ease-in-out infinite; }
+.sacard.sa-done .sdot { background: var(--vscode-testingIconPassed, var(--vscode-charts-green, green)); }
+.sacard.sa-fail .sdot { background: var(--vscode-errorForeground, red); }
+@keyframes sacard-pulse { 50% { opacity: .3; } }
+.sacard .sa-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sacard .sa-l2 { font-size: 11px; color: var(--vscode-descriptionForeground); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sacard .sa-l3 { font-size: 12px; margin-top: 2px; white-space: pre-wrap; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.sacard .sa-l3.act { color: var(--vscode-descriptionForeground); font-style: italic; white-space: nowrap; display: block; }
+.sacard .sa-foot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 4px; font-size: 11px; color: var(--vscode-descriptionForeground); }
+.sacard .sa-dur, .sacard .sa-files { font-variant-numeric: tabular-nums; }
+.sabadge { color: var(--vscode-listWarningForeground, var(--vscode-charts-orange, orange)); }
+.sacard .sa-acts { margin-left: auto; display: flex; gap: 3px; }
+.sacard .sa-acts button { font-size: 11px; padding: 1px 7px; border-radius: 3px; background: transparent; color: var(--vscode-foreground, inherit); }
+.sacard .sa-acts button:hover:not(:disabled) { background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,.18)); }
+.sacard .sa-acts button.apply { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+.sacard .sa-acts button.apply:hover { background: var(--vscode-button-hoverBackground); }
+/* Groupe de cartes : en-tête repliable « N sous-agents · … ». */
+.sagroup { margin: 8px 0; border: 1px solid var(--vscode-editorWidget-border, rgba(128,128,128,.3)); border-radius: 6px; }
+.sagroup > summary { display: flex; align-items: center; gap: 5px; padding: 4px 8px; font-size: 11px; color: var(--vscode-descriptionForeground); list-style: none; }
+.sagroup > summary::-webkit-details-marker { display: none; }
+.sagroup .sarrow { display: inline-block; transition: transform .1s; }
+.sagroup[open] .sarrow { transform: rotate(90deg); }
+.sagroup .sacards { display: flex; flex-direction: column; }
+.sagroup .sacard { margin: 0; border-left: none; border-right: none; border-bottom: none; border-radius: 0; }
 `;
 
 const CHAT_HTML_VIEW = `
@@ -612,9 +769,14 @@ const CHAT_HTML_VIEW = `
 </div>
 </div>
 <div id="subline"></div>
+<div id="lignee" hidden></div>
 <div id="errbar"></div>
 <div id="out"></div>
 <div id="filesblk"></div>
+<div id="robar" hidden>
+<span>Thread délégué en lecture seule — écrivez au thread principal, qui pilote ses sous-agents.</span>
+<button id="btnGoMain" type="button" title="Afficher le thread principal">Aller au thread principal</button>
+</div>
 <div id="vinput">
 <textarea id="vta" rows="1" aria-label="Message à l'agent" placeholder="Message à l'agent… (Entrée pour envoyer, Maj+Entrée pour une nouvelle ligne)"></textarea>
 <button id="vsend" type="button" title="Envoyer (Entrée)">Envoyer</button>

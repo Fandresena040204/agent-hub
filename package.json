@@ -2,7 +2,7 @@
   "name": "agent-hub",
   "displayName": "Agent Hub",
   "description": "Pilote plusieurs agents de codage (Claude Code, Codex, OpenCode, Antigravity) avec délégation.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "local",
   "license": "MIT",
   "engines": {

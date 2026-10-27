@@ -225,6 +225,8 @@ export class DelegateServer {
       violations: { scope_violation: t.violations.scope, commit_violation: t.violations.commits },
       summary: t.summary,
       error: t.error,
+      lastActivity: t.lastActivity,
+      durationSec: durationSecOf(t),
     };
   }
 
@@ -327,11 +329,12 @@ export class DelegateServer {
       },
       {
         name: 'message_thread',
-        description: 'Envoie un message de suivi à un thread délégué (reprend sa session).',
+        description:
+          'Seul moyen d\'envoyer un message de suivi à un sous-agent : les threads délégués sont en lecture seule pour l\'utilisateur.',
         inputSchema: { type: 'object', properties: { ...threadIdProp, text: str('Message.') }, required: ['threadId', 'text'] },
         handler: async (args, parentId) => {
           const t = this.ownThread(reqString(args, 'threadId'), parentId);
-          await this.orch.sendMessage(t.id, reqString(args, 'text'));
+          await this.orch.sendMessage(t.id, reqString(args, 'text'), { from: 'agent' });
           return { ok: true };
         },
       },
@@ -357,7 +360,16 @@ export class DelegateServer {
           this.orch
             .listThreads()
             .filter((t) => t.parentId === parentId)
-            .map((t) => ({ threadId: t.id, title: t.title, agent: t.agent, status: t.status, isolation: t.isolation, changedFiles: t.changedFiles.length })),
+            .map((t) => ({
+              threadId: t.id,
+              title: t.title,
+              agent: t.agent,
+              status: t.status,
+              isolation: t.isolation,
+              changedFiles: t.changedFiles.length,
+              lastActivity: t.lastActivity,
+              durationSec: durationSecOf(t),
+            })),
       },
       {
         name: 'interrupt_thread',
@@ -445,6 +457,12 @@ function optStringArray(args: Record<string, unknown>, key: string): string[] | 
 
 function truncate(s: string, max: number): string {
   return s.length > max ? `${s.slice(0, max)}…` : s;
+}
+
+/** Durée du thread en secondes : jusqu'à la fin du dernier tour, sinon jusqu'à maintenant. */
+function durationSecOf(t: ThreadInfo): number {
+  const end = t.finishedAt ?? Date.now();
+  return Math.max(0, Math.round((end - t.createdAt) / 1000));
 }
 
 function simplifyEvent(e: StoredEvent): Record<string, unknown> {

@@ -1,7 +1,10 @@
 // Logique pure de la vue de chat latérale (aucun import vscode) : testable.
 import type { ChangedFile } from '../core/orchestratorApi';
 import type { ThreadInfo } from '../core/types';
-import { escapeHtml, fileParts, fileStatusText, isThreadRunning, sortThreads } from './presentation';
+import {
+  cardDurationMs, cardPhase, escapeHtml, fileParts, fileStatusText, formatDuration, groupHeaderText,
+  isThreadRunning, sortThreads, truncate,
+} from './presentation';
 import type { FileStatus } from './presentation';
 
 // ---------------------------------------------------------------- sélecteur de thread
@@ -160,4 +163,91 @@ export function renderFilesBlockHtml(info: ThreadInfo, files: ChangedFile[]): st
     `<details id="fileshdr" open><summary>${head}<span class="fspacer"></span>${right.join('')}</summary>`
     + `<div class="frows">${files.map((f) => fileRowHtml(f, acts)).join('')}</div></details>`
   );
+}
+
+// ---------------------------------------------------------------- cartes de sous-agents
+
+/** Données d'une carte de sous-agent : thread, id de bloc (stable) et totaux de fichiers connus. */
+export interface SubagentCardDatum {
+  thread: ThreadInfo;
+  blockId: string;
+  totals?: FilesTotals;
+}
+
+/** Ligne 3 de la carte : activité en direct si le thread tourne, sinon résumé (ou message d'erreur). */
+export function subagentProgressText(t: ThreadInfo): string {
+  if (isThreadRunning(t.status)) return t.lastActivity ?? '';
+  return t.summary ?? t.error ?? '';
+}
+
+/** HTML d'une carte de sous-agent `<div class="sacard" data-thread="…">`, tout échappé. */
+export function subagentCardHtml(
+  info: ThreadInfo,
+  blockId: string,
+  groupId: string,
+  totals?: FilesTotals,
+  now: number = Date.now(),
+): string {
+  const eid = escapeHtml(info.id);
+  const phase = cardPhase(info.status);
+  const dur = formatDuration(cardDurationMs(info, now));
+  // Infobulle : agent, modèle, effort, isolation, scope, durée.
+  const tipParts = [threadSubtitle(info)];
+  if (info.scope?.length) tipParts.push(`périmètre : ${info.scope.join(', ')}`);
+  tipParts.push(dur);
+  const progress = subagentProgressText(info);
+  const l3Cls = phase === 'run' ? 'act' : phase === 'fail' && !info.summary ? 'bad' : 'sum';
+  const l3 = progress ? `<div class="sa-l3 ${l3Cls}">${escapeHtml(progress)}</div>` : '';
+  let files = '';
+  if (totals && totals.count > 0) {
+    files = `<span class="sa-files">${totals.count} fichier${totals.count > 1 ? 's' : ''}`;
+    if (totals.additions !== undefined) files += ` <span class="fnum add">+${totals.additions}</span>`;
+    if (totals.deletions !== undefined) files += ` <span class="fnum del">−${totals.deletions}</span>`;
+    files += '</span>';
+  }
+  const badges =
+    ((info.violations?.scope?.length ?? 0) > 0 ? '<span class="sabadge" title="Sorties du périmètre">⚠ scope</span>' : '')
+    + ((info.violations?.commits?.length ?? 0) > 0 ? '<span class="sabadge" title="Commits interdits">⚠ commit</span>' : '');
+  const acts: string[] = [
+    `<button type="button" class="fbtn" data-cact="openThread" data-id="${eid}" title="Ouvrir ce thread" aria-label="Ouvrir ce thread">Ouvrir</button>`,
+  ];
+  if (phase === 'run') {
+    acts.push(`<button type="button" class="fbtn" data-cact="stopThread" data-id="${eid}" title="Interrompre ce sous-agent" aria-label="Interrompre ce sous-agent">Stop</button>`);
+  }
+  if (info.isolation === 'worktree' && info.status === 'done') {
+    acts.push(`<button type="button" class="fbtn apply" data-cact="applyThread" data-id="${eid}" title="Appliquer le worktree au workspace" aria-label="Appliquer le worktree au workspace">Appliquer</button>`);
+  }
+  const running = phase === 'run' ? ' data-running="1"' : '';
+  return (
+    `<div id="${escapeHtml(blockId)}" class="sacard sa-${phase}" data-thread="${eid}" data-group="${escapeHtml(groupId)}"`
+    + ` data-start="${info.createdAt}"${running} title="${escapeHtml(tipParts.join(' · '))}">`
+    + `<div class="sa-l1"><span class="sdot"></span><span class="sa-title">${escapeHtml(truncate(info.title, 64))}</span></div>`
+    + `<div class="sa-l2">${escapeHtml(threadSubtitle(info))}</div>`
+    + l3
+    + `<div class="sa-foot"><span class="sa-dur">${dur}</span>${files}${badges}<span class="sa-acts">${acts.join('')}</span></div>`
+    + '</div>'
+  );
+}
+
+/** HTML du groupe repliable : en-tête « N sous-agents · … » (mis à jour en direct) + cartes. */
+export function subagentGroupHtml(members: SubagentCardDatum[], groupId: string): string {
+  const header = groupHeaderText(members.map((m) => m.thread));
+  return (
+    `<details class="sagroup" id="${escapeHtml(groupId)}" open>`
+    + `<summary class="sagroup-h"><span class="sarrow">▸</span><span class="sgtext">${escapeHtml(header)}</span></summary>`
+    + `<div class="sacards">${members.map((m) => subagentCardHtml(m.thread, m.blockId, groupId, m.totals)).join('')}</div>`
+    + '</details>'
+  );
+}
+
+/** Carte seule (délégation unique) ou groupe complet (≥ 2 délégations consécutives). */
+export function cardsBlockHtml(members: SubagentCardDatum[], groupId: string): { single: boolean; html: string } {
+  const m = members[0];
+  if (members.length <= 1) return { single: true, html: m ? subagentCardHtml(m.thread, m.blockId, groupId, m.totals) : '' };
+  return { single: false, html: subagentGroupHtml(members, groupId) };
+}
+
+/** Thread délégué affiché en lecture seule (réglage agentHub.delegation.readOnlyChildren). */
+export function readOnlyForThread(thread: ThreadInfo | undefined, readOnlyChildren: boolean): boolean {
+  return readOnlyChildren && !!thread?.parentId;
 }

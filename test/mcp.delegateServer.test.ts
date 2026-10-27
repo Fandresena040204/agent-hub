@@ -6,14 +6,19 @@ import type { AgentId, ThreadInfo } from '../src/core/types';
 function thread(id: string, parentId?: string): ThreadInfo {
   return {
     id, parentId, agent: 'opencode', permissionMode: 'edit', isolation: 'shared', cwd: '/ws', title: `t-${id}`,
-    status: 'done', createdAt: 0, updatedAt: 0, changedFiles: ['a.ts'], violations: { scope: [], commits: [] },
+    status: 'done', createdAt: 1_000_000, updatedAt: 1_060_000, changedFiles: ['a.ts'], violations: { scope: [], commits: [] },
+    lastActivity: 'outil read_thread', finishedAt: 1_060_000,
   };
 }
 
 /** Faux orchestrator en mémoire : seules les méthodes utilisées par le serveur sont réalistes. */
 function fakeOrch() {
   const threads = new Map<string, ThreadInfo>([['main1', thread('main1')], ['main2', thread('main2')], ['c2', thread('c2', 'main2')]]);
-  const calls = { delegate: [] as [string, DelegateRequest][], commit: [] as CommitRequest[] };
+  const calls = {
+    delegate: [] as [string, DelegateRequest][],
+    commit: [] as CommitRequest[],
+    sendMessage: [] as [string, string, { from?: 'user' | 'agent' } | undefined][],
+  };
   let n = 0;
   const orch = {
     workspaceRoot: '/ws',
@@ -36,7 +41,9 @@ function fakeOrch() {
       threads.set(t.id, t);
       return t;
     },
-    sendMessage: async () => undefined,
+    sendMessage: async (id: string, text: string, opts?: { from?: 'user' | 'agent' }) => {
+      calls.sendMessage.push([id, text, opts]);
+    },
     changeAgent: async (id: string, _req: ChangeAgentRequest) => threads.get(id)!,
     interrupt: async () => undefined,
     waitThread: async (id: string) => threads.get(id)!,
@@ -197,5 +204,46 @@ describe('DelegateServer', () => {
     expect(r.isError).toBe(false);
     expect((r.data as { changedFiles: string[] }).changedFiles).toEqual(['a.ts']);
     expect((r.data as { events: unknown[] }).events).toHaveLength(1);
+  });
+
+  it("message_thread transmet from:'agent' et se présente comme le seul canal vers un sous-agent", async () => {
+    const tools = (await rpc('tools/list')).body.result.tools as { name: string; description: string }[];
+    expect(tools.find((t) => t.name === 'message_thread')!.description).toContain(
+      'Seul moyen d\'envoyer un message de suivi à un sous-agent',
+    );
+
+    const { data } = await call('delegate', { agent: 'opencode', prompt: 'x', mode: 'readonly' });
+    const id = (data as { threadId: string }).threadId;
+    const r = await call('message_thread', { threadId: id, text: 'continue' });
+    expect(r.isError).toBe(false);
+    expect(calls.sendMessage).toEqual([[id, 'continue', { from: 'agent' }]]);
+  });
+
+  it('read_thread, wait_thread et list_threads exposent lastActivity et durationSec', async () => {
+    const { data } = await call('delegate', { agent: 'opencode', prompt: 'x', mode: 'readonly' });
+    const id = (data as { threadId: string }).threadId;
+
+    const read = (await call('read_thread', { threadId: id })).data as {
+      lastActivity?: string;
+      durationSec?: number;
+    };
+    expect(read.lastActivity).toBe('outil read_thread');
+    expect(read.durationSec).toBe(60);
+
+    const waited = (await call('wait_thread', { threadId: id, timeoutSec: 1 })).data as {
+      lastActivity?: string;
+      durationSec?: number;
+    };
+    expect(waited.lastActivity).toBe('outil read_thread');
+    expect(waited.durationSec).toBe(60);
+
+    const list = (await call('list_threads')).data as {
+      threadId: string;
+      lastActivity?: string;
+      durationSec?: number;
+    }[];
+    const entry = list.find((t) => t.threadId === id)!;
+    expect(entry.lastActivity).toBe('outil read_thread');
+    expect(entry.durationSec).toBe(60);
   });
 });

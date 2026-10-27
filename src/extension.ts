@@ -13,6 +13,7 @@ import { AGENT_IDS, type AgentId, type CommitPermission, type ThreadInfo } from 
 import { DelegateServer } from './mcp/DelegateServer';
 import { ThreadsTreeProvider } from './ui/ThreadsTreeProvider';
 import { ChatView } from './ui/ChatView';
+import { registerSubagentNotifications } from './ui/subagentNotifier';
 import { ChangesView, registerBaseContentProvider } from './ui/ChangesView';
 import { CommitStatusBar } from './ui/CommitStatusBar';
 import { confirmCommit } from './ui/commitDialog';
@@ -44,6 +45,7 @@ function readConfig(): OrchestratorConfig {
     includeUncommitted: c.get<boolean>('worktree.includeUncommitted', true),
     linkPaths: c.get<string[]>('worktree.linkPaths', ['node_modules']),
     mainAgentCommit: c.get<CommitPermission>('git.mainAgentCommit', 'deny'),
+    readOnlyChildren: c.get<boolean>('delegation.readOnlyChildren', true),
     defaults,
   };
 }
@@ -127,6 +129,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<AgentH
   context.subscriptions.push(
     chatView,
     vscode.window.registerWebviewViewProvider(ChatView.viewId, chatView, { webviewOptions: { retainContextWhenHidden: true } }),
+    registerSubagentNotifications(context, orch, chatView),
     vscode.window.registerTreeDataProvider('agentHub.threads', tree),
     vscode.window.registerTreeDataProvider('agentHub.changes', changes),
     registerBaseContentProvider(context, orch),

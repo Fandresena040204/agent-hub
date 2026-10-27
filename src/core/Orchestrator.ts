@@ -49,6 +49,8 @@ export interface OrchestratorConfig {
   includeUncommitted: boolean;
   linkPaths: string[];
   mainAgentCommit: CommitPermission;
+  /** Threads délégués en lecture seule pour l'utilisateur : seul l'agent principal leur écrit (message_thread). */
+  readOnlyChildren: boolean;
   defaults: Partial<Record<AgentId, { model?: string; effort?: string }>>;
 }
 
@@ -122,6 +124,17 @@ function messageOf(err: unknown): string {
 
 function titleOf(prompt: string): string {
   return prompt.replace(/\s+/g, ' ').trim().slice(0, 60);
+}
+
+/** Première ligne non vide, tronquée : résumé lisible de la dernière activité d'un thread. */
+function activityOf(text: string, max = 140): string {
+  const line = text.split(/\r?\n/).map((l) => l.trim()).find((l) => l.length > 0) ?? '';
+  return line.length > max ? `${line.slice(0, max - 1)}…` : line;
+}
+
+/** Nom d'outil affichable : sans le préfixe du serveur MCP agent-hub. */
+function toolActivity(name: string): string {
+  return `outil ${name.replace(/^mcp__agenthub__/, '')}`;
 }
 
 function readIfExists(abs: string): string | undefined {
@@ -493,13 +506,17 @@ export class Orchestrator implements OrchestratorApi {
       gitPolicy: defaultGitPolicy('sub'),
       systemPromptAppend: subSystemPrompt(req.mode, scope),
     };
+    // Carte vivante du sous-agent dans le thread PARENT : seulement une fois la délégation acceptée
+    // (scope acquis, worktree créé), pour ne jamais laisser de carte orpheline.
+    this.storeEvent(parentId, { type: 'subagent_started', threadId: thread.id });
     await this.launch(thread, opts);
     return thread;
   }
 
-  async sendMessage(threadId: string, text: string): Promise<void> {
+  async sendMessage(threadId: string, text: string, opts?: { from?: 'user' | 'agent' }): Promise<void> {
     const thread = this.threads.get(threadId);
     if (!thread) throw new Error(`Thread introuvable : ${threadId}`);
+    this.assertWritable(thread, opts);
     const rt = this.runtime(threadId);
 
     // Dossier de passation : préfixé au premier message suivant un changement d'agent.
@@ -511,6 +528,7 @@ export class Orchestrator implements OrchestratorApi {
     if (rt.run) {
       thread.status = 'running';
       thread.error = undefined;
+      thread.finishedAt = undefined;
       this.touch(thread);
       await rt.run.sendMessage(text);
       return;
@@ -536,11 +554,12 @@ export class Orchestrator implements OrchestratorApi {
 
     thread.status = 'running';
     thread.error = undefined;
+    thread.finishedAt = undefined;
     this.touch(thread);
     // Le prompt de reprise n'est pas émis par l'adaptateur : on l'enregistre ici.
     this.storeEvent(threadId, { type: 'user_text', text });
 
-    const opts: StartOptions = {
+    const startOpts: StartOptions = {
       prompt: text,
       cwd: thread.cwd,
       model: thread.model,
@@ -556,10 +575,10 @@ export class Orchestrator implements OrchestratorApi {
     if (!thread.parentId && this.mcp) {
       const token = this.mcp.registerMainThread(threadId);
       rt.mcpToken = token;
-      opts.mcpServerUrl = this.mcp.url();
-      opts.mcpToken = token;
+      startOpts.mcpServerUrl = this.mcp.url();
+      startOpts.mcpToken = token;
     }
-    await this.launch(thread, opts);
+    await this.launch(thread, startOpts);
   }
 
   /**
@@ -569,6 +588,8 @@ export class Orchestrator implements OrchestratorApi {
   async changeAgent(threadId: string, req: ChangeAgentRequest): Promise<ThreadInfo> {
     const thread = this.threads.get(threadId);
     if (!thread) throw new Error(`Thread introuvable : ${threadId}`);
+    // Un thread délégué en lecture seule n'appartient qu'à son agent principal : pas de changement d'agent.
+    this.assertWritable(thread);
     if (isActive(thread.status)) {
       throw new Error(
         `Le thread ${threadId} est en cours : interrompez-le ou attendez la fin du tour avant de changer d'agent.`,
@@ -725,6 +746,7 @@ export class Orchestrator implements OrchestratorApi {
     }
     if (isActive(thread.status)) {
       thread.status = 'interrupted';
+      thread.finishedAt = Date.now();
       this.scopeRegistry.release(threadId);
     }
     this.touch(thread);
@@ -843,6 +865,7 @@ export class Orchestrator implements OrchestratorApi {
     }
     if (isActive(thread.status)) {
       thread.status = thread.parentId ? 'done' : 'idle';
+      thread.finishedAt = Date.now();
       this.scopeRegistry.release(threadId);
       this.touch(thread);
     }
@@ -863,7 +886,13 @@ export class Orchestrator implements OrchestratorApi {
         }
         break;
       case 'assistant_text':
-        if (!event.partial && event.text.trim()) thread.summary = event.text.trim();
+        if (!event.partial && event.text.trim()) {
+          thread.summary = event.text.trim();
+          thread.lastActivity = activityOf(event.text);
+        }
+        break;
+      case 'tool_call':
+        thread.lastActivity = toolActivity(event.name);
         break;
       case 'file_changed':
         newViolations = this.applyFileChanged(thread, rt, event.path);
@@ -877,11 +906,13 @@ export class Orchestrator implements OrchestratorApi {
       case 'done':
         thread.status = thread.parentId ? 'done' : 'idle';
         thread.summary = event.summary;
+        thread.finishedAt = Date.now();
         this.clearThreadTimeout(rt);
         break;
       case 'error':
         thread.status = 'error';
         thread.error = event.message;
+        thread.finishedAt = Date.now();
         this.clearThreadTimeout(rt);
         break;
       default:
@@ -1177,6 +1208,20 @@ export class Orchestrator implements OrchestratorApi {
   }
 
   // ── Helpers internes ────────────────────────────────────────────────
+
+  /**
+   * Refuse une action « utilisateur » sur un thread délégué quand les threads enfants sont en lecture seule.
+   * L'agent principal (outil MCP message_thread) passe `from: 'agent'`.
+   */
+  private assertWritable(thread: ThreadInfo, opts?: { from?: 'user' | 'agent' }): void {
+    if (!thread.parentId) return;
+    if (!this.configFn().readOnlyChildren) return;
+    if ((opts?.from ?? 'user') === 'agent') return;
+    const parent = this.threads.get(thread.parentId);
+    throw new Error(
+      `Les threads délégués sont en lecture seule : écrivez au thread principal (${parent?.title ?? thread.parentId}), qui pilote ses sous-agents.`,
+    );
+  }
 
   private createThread(o: CreateThreadOptions): ThreadInfo {
     const now = Date.now();
